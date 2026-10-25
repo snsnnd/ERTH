@@ -11,6 +11,8 @@
 #define INVALID_NODE_ID -1 // 定义无效节点ID
 
 // 定义全局变量（分配内存，仅在此处定义一次）
+// 注意：C 中 `= {-1}` 仅把 [0] 置 -1、其余为 0（0 会被误当成合法索引 0），
+// 完整的全表 -1 初始化在 map_globalmap_init_id_map() 中用 memset 完成
 int16_t g_node_id_to_idx[MAX_NODE_ID] = {-1}; // 初始化全为-1
 bool g_node_map_inited = false;               // 初始化为未初始化
 // 新增：边代价索引表（假设节点ID范围不超过MAX_NODE_ID）
@@ -327,6 +329,10 @@ void map_globalmap_init_id_map(Map *map)
     {
         return; // 已初始化或地图无效，直接返回
     }
+
+    // 最小修复：先把全表置 -1（原 `={-1}` 只初始化了 [0]，其余为 0，
+    // 会导致未使用的 id 被误查到索引 0 → 返回错误节点）
+    memset(g_node_id_to_idx, 0xFF, sizeof(g_node_id_to_idx));
 
     // 遍历所有节点，记录node_id对应的索引
     for (uint16_t i = 0; i < map->node_count; i++)

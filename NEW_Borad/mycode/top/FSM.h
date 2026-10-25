@@ -34,6 +34,16 @@ typedef struct
     float target_x, target_y;
     float enemy_x, enemy_y;
 
+    // 对战协议：对手上报位置（平台经 ORP: 下发的校验后位置，地图坐标）
+    float oppo_x, oppo_y;
+    uint8_t oppo_valid;      // 1=有效（5s 内收到过 ORP）
+    uint32_t oppo_last_ms;   // 最近一次收到 ORP 的时间戳（ms）
+
+    // 对战协议：POS/RPOS 上报节流
+    uint32_t last_pos_send_ms; // 上次上报时间戳（ms）
+    float last_sent_x, last_sent_y; // 上次上报时的位置（变化阈值判断）
+    uint8_t pos_sent_once;     // 是否已上报过至少一次
+
     Direction current_direction;
 
     // 状态标志

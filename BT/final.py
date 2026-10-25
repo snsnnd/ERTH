@@ -4,13 +4,14 @@ import re
 import struct
 import serial
 import time
+from html import escape
 import serial.tools.list_ports
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
                              QWidget, QPushButton, QComboBox, QTextEdit, QLabel,
                              QGroupBox, QTabWidget, QSpinBox, QDoubleSpinBox,
                              QCheckBox, QFileDialog, QMessageBox, QSplitter,
                              QProgressDialog, QListWidget, QDialog, QDialogButtonBox,
-                             QLineEdit)
+                             QLineEdit, QStackedWidget)
 from PyQt5.QtCore import QTimer, Qt, QPointF, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QColor
 import pyqtgraph as pg
@@ -26,6 +27,228 @@ except ImportError:
     print("未安装 bleak 库，蓝牙功能不可用。请运行: pip install bleak")
 
 import asyncio
+
+
+# ==================== 对战协议 v1：图结构 / 裁判（纯函数） ====================
+
+GRID_STEP = 400.0      # 地图网格间距（估算跳数折算基准）
+RPOS_MAX_HOPS = 2      # RPOS 允许的最大图上跳数
+
+LOG_COLOR_A = '#1565C0'     # Car A 日志：蓝
+LOG_COLOR_B = '#C62828'     # Car B 日志：红
+LOG_COLOR_SYS = '#00695C'   # 转发/系统事件
+LOG_COLOR_WARN = '#D84315'  # 告警
+LOG_COLOR_GREY = '#757575'  # 离线等提示
+
+
+def build_adjacency(nodes):
+    """由节点列表构建无向邻接表: {node_id: set(neighbor_id)}（map.c 的边按无向处理）"""
+    adj = {}
+    ids = set()
+    for node in nodes:
+        nid = node['node_id']
+        ids.add(nid)
+        adj.setdefault(nid, set())
+    for node in nodes:
+        nid = node['node_id']
+        for nb in node.get('neighbors', []):
+            if nb in ids:
+                adj[nid].add(nb)
+                adj[nb].add(nid)
+    return adj
+
+
+def nearest_node(xy, nodes):
+    """欧氏距离最近节点，返回 node_id；坐标或节点缺失时返回 None"""
+    if not xy or not nodes:
+        return None
+    x, y = xy
+    best_id = None
+    best_d2 = None
+    for node in nodes:
+        d2 = (node['x'] - x) ** 2 + (node['y'] - y) ** 2
+        if best_d2 is None or d2 < best_d2:
+            best_id = node['node_id']
+            best_d2 = d2
+    return best_id
+
+
+def graph_dist(n1, n2, adj):
+    """BFS 求无向图两节点跳数；节点不存在或不可达返回 None"""
+    if adj is None or n1 is None or n2 is None:
+        return None
+    if n1 not in adj or n2 not in adj:
+        return None
+    if n1 == n2:
+        return 0
+    visited = {n1}
+    frontier = [n1]
+    dist = 0
+    while frontier:
+        dist += 1
+        nxt = []
+        for cur in frontier:
+            for nb in adj[cur]:
+                if nb == n2:
+                    return dist
+                if nb not in visited:
+                    visited.add(nb)
+                    nxt.append(nb)
+        frontier = nxt
+    return None
+
+
+def _estimate_hops(pos_xy, rpos_xy):
+    """节点缺失时的降级估算：欧氏距离 / GRID_STEP"""
+    if not pos_xy or not rpos_xy:
+        return 0.0
+    dx = pos_xy[0] - rpos_xy[0]
+    dy = pos_xy[1] - rpos_xy[1]
+    return (dx * dx + dy * dy) ** 0.5 / GRID_STEP
+
+
+def judge_rpos_ex(pos_xy, rpos_xy, graph):
+    """裁判 RPOS 上报，返回 (ok, d, degraded)。
+
+    ok        是否放行（图距离 <= RPOS_MAX_HOPS）
+    d         图上跳数；降级路径返回欧氏距离估算跳数
+    degraded  是否走了降级放行路径（需日志告警）
+    """
+    nodes = graph.get('nodes') if graph else None
+    adj = graph.get('adj') if graph else None
+    n1 = nearest_node(pos_xy, nodes)
+    n2 = nearest_node(rpos_xy, nodes)
+    if n1 is None or n2 is None:
+        return True, _estimate_hops(pos_xy, rpos_xy), True
+    d = graph_dist(n1, n2, adj)
+    if d is None:
+        return True, _estimate_hops(pos_xy, rpos_xy), True
+    return d <= RPOS_MAX_HOPS, d, False
+
+
+def judge_rpos(pos_xy, rpos_xy, graph):
+    """裁判接口：(ok, d)。ok 为 False 时 d 为实际图距离（用于 ERR:RPOS,<d>）"""
+    ok, d, _degraded = judge_rpos_ex(pos_xy, rpos_xy, graph)
+    return ok, d
+
+
+class CarLink:
+    """单车 SPP 串口链路封装（对战协议 v1）
+
+    - bytes 级缓冲按 \\n 切分后再逐行解码，避免粘包时劈坏多字节字符
+    - 接收缓冲上限 8KB 防溢出
+    - per-car 状态：pos / rpos / 最后收时间 / 最后 POS 时间（3 秒离线判定）
+    """
+    BUFFER_LIMIT = 8 * 1024   # 接收缓冲上限（字节）
+    OFFLINE_TIMEOUT = 3.0     # 秒：未收到 POS 判离线
+
+    def __init__(self, tag, on_line=None, encoding='utf-8'):
+        self.tag = tag                     # 'A' / 'B'
+        self.port = None
+        self.baudrate = 115200
+        self.serial_obj = None
+        self.encoding = encoding
+        self.on_line = on_line             # callback(tag, line)
+        self.rx_buffer = b''               # bytes 级粘包缓冲
+        # per-car 状态
+        self.pos = None                    # (x, y) 实际位置
+        self.rpos = None                   # (x, y) 上报位置
+        self.last_rx_time = 0.0            # 最后收到任意数据的时间
+        self.last_pos_time = 0.0           # 最后收到 POS 的时间
+        # 10ms 轮询读取定时器
+        self.timer = QTimer()
+        self.timer.timeout.connect(self._read_tick)
+
+    # ---------- 连接管理 ----------
+    @property
+    def is_open(self):
+        return bool(self.serial_obj is not None and getattr(self.serial_obj, 'is_open', False))
+
+    def connect(self, port, baudrate):
+        """打开串口并启动轮询读取"""
+        self.disconnect()
+        self.port = port
+        self.baudrate = int(baudrate)
+        self.serial_obj = serial.Serial(port, self.baudrate, timeout=1)
+        self.rx_buffer = b''
+        self.timer.start(10)  # 每 10ms 读取一次
+        return True
+
+    def disconnect(self):
+        """关闭串口并停止读取定时器"""
+        self.timer.stop()
+        if self.serial_obj is not None:
+            try:
+                if self.serial_obj.is_open:
+                    self.serial_obj.close()
+            except Exception as e:
+                print(f"[{self.tag}] 关闭串口错误: {e}")
+        self.serial_obj = None
+        self.rx_buffer = b''
+
+    def close(self):
+        """关窗清理"""
+        self.disconnect()
+
+    # ---------- 接收：bytes 缓冲按 \n 切分，再逐行解码 ----------
+    def feed_bytes(self, data):
+        """喂入原始字节，返回解码完成的完整行列表（不含换行符）"""
+        if not data:
+            return []
+        self.rx_buffer += data
+        if len(self.rx_buffer) > self.BUFFER_LIMIT:
+            # 防溢出：只保留缓冲区尾部
+            self.rx_buffer = self.rx_buffer[-self.BUFFER_LIMIT:]
+        lines = []
+        while b'\n' in self.rx_buffer:
+            raw, self.rx_buffer = self.rx_buffer.split(b'\n', 1)
+            line = raw.decode(self.encoding, errors='ignore').rstrip('\r')
+            line = line.strip()
+            if line:
+                lines.append(line)
+        return lines
+
+    def _read_tick(self):
+        """定时读取串口（10ms 轮询）"""
+        if not self.is_open:
+            return
+        try:
+            bytes_to_read = min(self.serial_obj.in_waiting, 1024)
+            if bytes_to_read > 0:
+                data = self.serial_obj.read(bytes_to_read)
+                for line in self.feed_bytes(data):
+                    self.last_rx_time = time.time()
+                    if self.on_line:
+                        self.on_line(self.tag, line)
+        except Exception as e:
+            print(f"[{self.tag}] 串口读取错误: {e}")
+
+    # ---------- 发送 ----------
+    def send_line(self, text):
+        """发送一行文本（自动补 \\n），成功返回 True"""
+        if not self.is_open:
+            return False
+        try:
+            if not text.endswith('\n'):
+                text += '\n'
+            self.serial_obj.write(text.encode(self.encoding, errors='ignore'))
+            return True
+        except Exception as e:
+            print(f"[{self.tag}] 串口发送错误: {e}")
+            return False
+
+    # ---------- 在线判定 ----------
+    def note_pos(self):
+        """记录收到 POS 的时间（离线判定依据）"""
+        self.last_pos_time = time.time()
+
+    def is_online(self, now=None):
+        """3 秒内收到过 POS 才算在线"""
+        if self.last_pos_time <= 0:
+            return False
+        if now is None:
+            now = time.time()
+        return (now - self.last_pos_time) <= self.OFFLINE_TIMEOUT
 
 
 class BluetoothScanWorker(QThread):
@@ -217,42 +440,60 @@ class DeviceSelectionDialog(QDialog):
 
 # 地图可视化组件
 class MapWidget(QWidget):
+    """双车对战地图：A=蓝、B=红；实心点=真实位置(POS)，空心点=上报位置(RPOS)，虚线=谎报偏差"""
+
+    # 图例定义（名称 + 样式）
+    LEGEND_SPECS = [
+        ('A 实际位置', {'pen': None, 'symbol': 'o', 'symbolSize': 12,
+                       'symbolBrush': 'b', 'symbolPen': 'b'}),
+        ('A 上报位置(谎报)', {'pen': None, 'symbol': 'o', 'symbolSize': 12,
+                            'symbolBrush': None, 'symbolPen': 'b'}),
+        ('B 实际位置', {'pen': None, 'symbol': 'o', 'symbolSize': 12,
+                       'symbolBrush': 'r', 'symbolPen': 'r'}),
+        ('B 上报位置(谎报)', {'pen': None, 'symbol': 'o', 'symbolSize': 12,
+                            'symbolBrush': None, 'symbolPen': 'r'}),
+        ('谎报偏差', {'pen': pg.mkPen('gray', width=2, style=Qt.DashLine), 'symbol': None}),
+    ]
+
     def __init__(self):
         super().__init__()
         self.nodes = []
         self.edges = []
-        self.current_pos = None
-        self.enemy_pos = None
-        self._current_pos_item = None
-        self._enemy_pos_item = None
+        self.adj = {}                          # 无向邻接表（裁判用）
+        self.graph = {'nodes': [], 'adj': {}}   # judge_rpos 使用的图结构
 
-        # 为每种元素维护独立的防抖状态
-        self.position_state = {
-            'last_update_time': 0,
-            'pending_update': False
-        }
-        self.enemy_state = {
-            'last_update_time': 0,
-            'pending_update': False
-        }
+        # 每辆车独立的显示状态与防抖状态
+        self.car_state = {}
+        for tag in ('A', 'B'):
+            self.car_state[tag] = {
+                'pos': None,       # 真实位置 (x, y)
+                'rpos': None,      # 上报位置 (x, y)
+                'pos_item': None,
+                'rpos_item': None,
+                'link_item': None,
+                'pos_debounce': {'last_update_time': 0, 'pending_update': False},
+                'rpos_debounce': {'last_update_time': 0, 'pending_update': False},
+            }
 
         self.update_interval = 100
         self.init_ui()
 
-    def update_enemy_position(self, x, y):
-        """更新敌人位置"""
-        self.enemy_pos = {'x': x, 'y': y}
+    def update_car_position(self, tag, x, y):
+        """更新某车真实位置（POS 直接定位）"""
+        st = self.car_state[tag]
+        st['pos'] = (x, y)
         self._update_marker_with_debounce(
-            self.enemy_state,
-            self.update_enemy_position_marker
+            st['pos_debounce'],
+            lambda t=tag: self._redraw_car_marker(t)
         )
 
-    def update_position(self, x, y):
-        """更新当前位置"""
-        self.current_pos = {'x': x, 'y': y}
+    def update_car_report(self, tag, x, y):
+        """更新某车上报位置（RPOS 幽灵点 + 谎报偏差虚线）"""
+        st = self.car_state[tag]
+        st['rpos'] = (x, y)
         self._update_marker_with_debounce(
-            self.position_state,
-            self.update_current_position_marker
+            st['rpos_debounce'],
+            lambda t=tag: self._redraw_car_marker(t)
         )
 
     # 替换 MapWidget 类中的防抖相关方法
@@ -279,33 +520,61 @@ class MapWidget(QWidget):
         state['pending_update'] = False  # 重置pending状态
         update_func()
 
-    def update_current_position_marker(self):
-        """更新当前位置标记"""
-        # 移除旧的位置标记（如果存在）
-        if hasattr(self, '_current_pos_item') and self._current_pos_item:
-            self.plot_widget.removeItem(self._current_pos_item)
+    def _car_color(self, tag):
+        """车辆配色：A=蓝, B=红"""
+        return 'b' if tag == 'A' else 'r'
 
-        # 添加新的位置标记
-        if self.current_pos:
-            self._current_pos_item = pg.PlotDataItem(
-                [self.current_pos['x']], [self.current_pos['y']],
-                pen=None, symbol='o', symbolSize=15, symbolBrush='g'
+    def _redraw_car_marker(self, tag):
+        """重绘某车的三个标记：真实点（实心）、上报幽灵点（空心）、谎报偏差虚线"""
+        st = self.car_state[tag]
+        color = self._car_color(tag)
+
+        for key in ('pos_item', 'rpos_item', 'link_item'):
+            if st[key] is not None:
+                try:
+                    self.plot_widget.removeItem(st[key])
+                except Exception:
+                    pass
+                st[key] = None
+
+        if st['pos']:
+            st['pos_item'] = pg.PlotDataItem(
+                [st['pos'][0]], [st['pos'][1]],
+                pen=None, symbol='o', symbolSize=15,
+                symbolBrush=color, symbolPen=color
             )
-            self.plot_widget.addItem(self._current_pos_item)
+            self.plot_widget.addItem(st['pos_item'])
 
-    def update_enemy_position_marker(self):
-        """更新敌人位置标记"""
-        # 移除旧的敌人位置标记（如果存在）
-        if hasattr(self, '_enemy_pos_item') and self._enemy_pos_item:
-            self.plot_widget.removeItem(self._enemy_pos_item)
-
-        # 添加新的敌人位置标记
-        if self.enemy_pos:
-            self._enemy_pos_item = pg.PlotDataItem(
-                [self.enemy_pos['x']], [self.enemy_pos['y']],
-                pen=None, symbol='o', symbolSize=15, symbolBrush='r'
+        if st['rpos']:
+            st['rpos_item'] = pg.PlotDataItem(
+                [st['rpos'][0]], [st['rpos'][1]],
+                pen=None, symbol='o', symbolSize=15,
+                symbolBrush=None, symbolPen=pg.mkPen(color, width=2)
             )
-            self.plot_widget.addItem(self._enemy_pos_item)
+            self.plot_widget.addItem(st['rpos_item'])
+
+        if st['pos'] and st['rpos']:
+            st['link_item'] = pg.PlotDataItem(
+                [st['pos'][0], st['rpos'][0]],
+                [st['pos'][1], st['rpos'][1]],
+                pen=pg.mkPen(color, width=2, style=Qt.DashLine)
+            )
+            self.plot_widget.addItem(st['link_item'])
+
+    def _add_legend_entries(self):
+        """（重）建图例条目，避免 clear() 后条目丢失或重复"""
+        legend = getattr(self.plot_widget, 'legend', None)
+        if legend is None:
+            return
+        for name, kw in self.LEGEND_SPECS:
+            try:
+                legend.removeItem(name)
+            except Exception:
+                pass
+            try:
+                self.plot_widget.plot([], [], name=name, **kw)
+            except Exception:
+                pass
 
     def init_ui(self):
         layout = QVBoxLayout()
@@ -318,6 +587,7 @@ class MapWidget(QWidget):
         self.plot_widget.setTitle('地图可视化')
         self.plot_widget.showGrid(x=True, y=True)
         self.plot_widget.setAspectLocked(True)
+        self.plot_widget.addLegend()
 
         layout.addWidget(self.plot_widget)
         self.setLayout(layout)
@@ -380,6 +650,10 @@ class MapWidget(QWidget):
                     'cost': cost
                 })
 
+            # 构建裁判用的无向邻接表与图结构
+            self.adj = build_adjacency(self.nodes)
+            self.graph = {'nodes': self.nodes, 'adj': self.adj}
+
             # 绘制地图
             self.draw_map()
             return True
@@ -433,12 +707,10 @@ class MapWidget(QWidget):
             text.setPos(node['x'], node['y'])
             self.plot_widget.addItem(text)
 
-        # 重新添加所有标记项（使用防抖机制）
-        if self.current_pos:
-            self.update_position(self.current_pos['x'], self.current_pos['y'])
-
-        if self.enemy_pos:
-            self.update_enemy_position(self.enemy_pos['x'], self.enemy_pos['y'])
+        # 重新添加图例与所有车辆标记（真实点/上报点/偏差虚线）
+        self._add_legend_entries()
+        for tag in ('A', 'B'):
+            self._redraw_car_marker(tag)
 
 
 # PID可视化组件
@@ -641,19 +913,21 @@ class PIDWidget(QWidget):
 
 # 主窗口
 class BluetoothDebugTool(QMainWindow):
-    # 修改 BluetoothDebugTool 类的 __init__ 方法
     def __init__(self):
         super().__init__()
-        self.serial_connection = None
         self.bluetooth_connection = None
-        self.is_connected = False
         self.is_bluetooth_connected = False
         self.received_data = ""
         self.bluetooth_scan_worker = None
         self.bluetooth_connection_worker = None
         self.services = None
         self.current_encoding = 'utf-8'
-        self.serial_buffer = ""  # 用于存储未完成的串口数据
+        # 双车对战链路（A/B 各一路 SPP 串口）
+        self.links = {
+            'A': CarLink('A', on_line=self.on_car_line),
+            'B': CarLink('B', on_line=self.on_car_line),
+        }
+        self._prev_online = {'A': False, 'B': False}
 
         # 初始化 UI
         self.init_ui()
@@ -675,31 +949,16 @@ class BluetoothDebugTool(QMainWindow):
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
 
-        # 蓝牙连接控制
+        # 连接控制（双车对战：Car A / Car B 各一路 SPP 串口）
         connection_group = QGroupBox("连接控制")
         connection_layout = QVBoxLayout(connection_group)
 
-        # 串口连接部分
-        serial_layout = QHBoxLayout()
-        serial_layout.addWidget(QLabel("串口:"))
-        self.port_combo = QComboBox()
-        self.refresh_ports()
-        serial_layout.addWidget(self.port_combo)
+        # 双车串口连接区：端口 + 刷新 + 波特率 + 连接/断开 + 在线状态灯
+        self.car_ui = {}
+        for tag in ('A', 'B'):
+            connection_layout.addWidget(self._build_car_group(tag))
 
-        refresh_btn = QPushButton("刷新")
-        refresh_btn.clicked.connect(self.refresh_ports)
-        serial_layout.addWidget(refresh_btn)
-        connection_layout.addLayout(serial_layout)
-
-        baud_layout = QHBoxLayout()
-        baud_layout.addWidget(QLabel("波特率:"))
-        self.baud_combo = QComboBox()
-        self.baud_combo.addItems(["9600", "115200", "230400", "460800", "921600"])
-        self.baud_combo.setCurrentText("115200")
-        baud_layout.addWidget(self.baud_combo)
-        connection_layout.addLayout(baud_layout)
-
-        # 解码方式选择
+        # 解码方式选择（两路串口共用）
         decode_layout = QHBoxLayout()
         decode_layout.addWidget(QLabel("解码方式:"))
         self.decode_combo = QComboBox()
@@ -708,17 +967,6 @@ class BluetoothDebugTool(QMainWindow):
         self.decode_combo.currentTextChanged.connect(self.update_encoding)
         decode_layout.addWidget(self.decode_combo)
         connection_layout.addLayout(decode_layout)
-
-        serial_btn_layout = QHBoxLayout()
-        self.connect_btn = QPushButton("串口连接")
-        self.connect_btn.clicked.connect(self.toggle_serial_connection)
-        serial_btn_layout.addWidget(self.connect_btn)
-
-        self.disconnect_btn = QPushButton("断开")
-        self.disconnect_btn.clicked.connect(self.disconnect_serial)
-        self.disconnect_btn.setEnabled(False)
-        serial_btn_layout.addWidget(self.disconnect_btn)
-        connection_layout.addLayout(serial_btn_layout)
 
         # 蓝牙连接部分
         if BLUETOOTH_SUPPORTED:
@@ -755,6 +1003,11 @@ class BluetoothDebugTool(QMainWindow):
         send_layout.addWidget(self.send_text)
 
         send_btn_layout = QHBoxLayout()
+        send_btn_layout.addWidget(QLabel("目标:"))
+        self.send_target_combo = QComboBox()
+        self.send_target_combo.addItems(["A", "B", "蓝牙"])
+        send_btn_layout.addWidget(self.send_target_combo)
+
         self.send_btn = QPushButton("发送")
         self.send_btn.clicked.connect(self.send_data)
         send_btn_layout.addWidget(self.send_btn)
@@ -786,9 +1039,24 @@ class BluetoothDebugTool(QMainWindow):
         # 创建标签页
         self.tab_widget = QTabWidget()
 
-        # PID可视化标签页
-        self.pid_widget = PIDWidget()
-        self.tab_widget.addTab(self.pid_widget, "PID可视化")
+        # PID可视化标签页（双车各自独立数据，下拉切换显示车辆）
+        pid_tab = QWidget()
+        pid_layout = QVBoxLayout(pid_tab)
+        pid_sel_row = QHBoxLayout()
+        pid_sel_row.addWidget(QLabel("车辆:"))
+        self.pid_car_combo = QComboBox()
+        self.pid_car_combo.addItems(["A", "B"])
+        pid_sel_row.addWidget(self.pid_car_combo)
+        pid_sel_row.addStretch(1)
+        pid_layout.addLayout(pid_sel_row)
+
+        self.pid_widgets = {'A': PIDWidget(), 'B': PIDWidget()}
+        self.pid_stack = QStackedWidget()
+        self.pid_stack.addWidget(self.pid_widgets['A'])
+        self.pid_stack.addWidget(self.pid_widgets['B'])
+        self.pid_car_combo.currentIndexChanged.connect(self.pid_stack.setCurrentIndex)
+        pid_layout.addWidget(self.pid_stack)
+        self.tab_widget.addTab(pid_tab, "PID可视化")
 
         # 地图可视化标签页
         self.map_widget = MapWidget()
@@ -815,25 +1083,147 @@ class BluetoothDebugTool(QMainWindow):
         splitter.addWidget(right_panel)
         splitter.setSizes([400, 800])
 
-        # 创建定时器用于读取串口数据
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.read_serial_data)
+        # 状态灯轮询定时器（3 秒无 POS 判离线 + 转发暂停提示）
+        self.status_timer = QTimer()
+        self.status_timer.timeout.connect(self._refresh_status_lights)
+        self.status_timer.start(500)
+
+    # ---------- 双车连接区 UI 构建 ----------
+    def _build_car_group(self, tag):
+        """构建某辆车的串口连接分组（端口下拉 + 刷新 + 波特率 + 连接/断开 + 状态灯）"""
+        box = QGroupBox(f"Car {tag}")
+        layout = QVBoxLayout(box)
+
+        serial_row = QHBoxLayout()
+        serial_row.addWidget(QLabel("串口:"))
+        port_combo = QComboBox()
+        for port in serial.tools.list_ports.comports():
+            port_combo.addItem(port.device)
+        serial_row.addWidget(port_combo)
+        refresh_btn = QPushButton("刷新")
+        refresh_btn.clicked.connect(self.refresh_ports)
+        serial_row.addWidget(refresh_btn)
+        layout.addLayout(serial_row)
+
+        baud_row = QHBoxLayout()
+        baud_row.addWidget(QLabel("波特率:"))
+        baud_combo = QComboBox()
+        baud_combo.addItems(["9600", "115200", "230400", "460800", "921600"])
+        baud_combo.setCurrentText("115200")
+        baud_row.addWidget(baud_combo)
+        layout.addLayout(baud_row)
+
+        btn_row = QHBoxLayout()
+        connect_btn = QPushButton(f"连接 Car {tag}")
+        connect_btn.clicked.connect(lambda _=False, t=tag: self.connect_car(t))
+        btn_row.addWidget(connect_btn)
+        disconnect_btn = QPushButton("断开")
+        disconnect_btn.clicked.connect(lambda _=False, t=tag: self.disconnect_car(t))
+        disconnect_btn.setEnabled(False)
+        btn_row.addWidget(disconnect_btn)
+        status_label = QLabel("● 离线")
+        status_label.setStyleSheet("color: #9E9E9E;")
+        btn_row.addWidget(status_label)
+        layout.addLayout(btn_row)
+
+        self.car_ui[tag] = {
+            'port': port_combo,
+            'baud': baud_combo,
+            'connect': connect_btn,
+            'disconnect': disconnect_btn,
+            'status': status_label,
+        }
+        return box
+
+    # ---------- 日志（HTML 着色：A=蓝, B=红, 告警/转发另有配色） ----------
+    def append_log(self, prefix, text, color=None):
+        """日志区追加一行（HTML 着色）；prefix 形如 'A'，显示为 [A] ..."""
+        if color is None:
+            color = {'A': LOG_COLOR_A, 'B': LOG_COLOR_B}.get(prefix, LOG_COLOR_SYS)
+        escaped = escape(str(text)).replace('\n', '<br>')
+        self.receive_text.append(
+            f'<span style="color:{color};">[{escape(str(prefix))}] {escaped}</span>'
+        )
+
+    # ---------- 串口连接管理（per-car） ----------
+    def connect_car(self, tag):
+        """连接某车串口"""
+        ui = self.car_ui[tag]
+        port = ui['port'].currentText()
+        if not port:
+            QMessageBox.warning(self, "警告", f"请选择 Car {tag} 串口")
+            return
+        try:
+            baudrate = int(ui['baud'].currentText())
+            self.links[tag].connect(port, baudrate)
+            self.links[tag].encoding = self.current_encoding
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"Car {tag} 连接失败: {str(e)}")
+            return
+        ui['connect'].setEnabled(False)
+        ui['disconnect'].setEnabled(True)
+        ui['port'].setEnabled(False)
+        ui['baud'].setEnabled(False)
+        self.append_log(tag, f"已连接 {port}，波特率 {baudrate}")
+
+    def disconnect_car(self, tag):
+        """断开某车串口"""
+        ui = self.car_ui[tag]
+        link = self.links[tag]
+        link.disconnect()
+        link.pos = None
+        link.rpos = None
+        link.last_pos_time = 0.0
+        # 重置该车防抖状态
+        st = self.map_widget.car_state.get(tag)
+        if st:
+            st['pos_debounce']['pending_update'] = False
+            st['rpos_debounce']['pending_update'] = False
+        ui['connect'].setEnabled(True)
+        ui['disconnect'].setEnabled(False)
+        ui['port'].setEnabled(True)
+        ui['baud'].setEnabled(True)
+        ui['status'].setText("● 离线")
+        ui['status'].setStyleSheet("color: #9E9E9E;")
+        self._prev_online[tag] = False
+        self.append_log(tag, "已断开串口连接", LOG_COLOR_GREY)
+
+    def _refresh_status_lights(self):
+        """刷新两车在线状态灯；由在线转离线时记录“转发暂停”日志"""
+        now = time.time()
+        for tag, link in self.links.items():
+            online = link.is_online(now)
+            ui = self.car_ui[tag]
+            if online:
+                ui['status'].setText("● 在线")
+                ui['status'].setStyleSheet("color: #2E7D32; font-weight: bold;")
+            else:
+                ui['status'].setText("● 离线")
+                ui['status'].setStyleSheet("color: #9E9E9E;")
+            if self._prev_online[tag] and not online:
+                self.append_log(tag, "离线（3 秒未收到 POS），转发暂停", LOG_COLOR_GREY)
+            self._prev_online[tag] = online
 
     def update_encoding(self, text):
-        """更新解码方式"""
+        """更新解码方式（两路串口共用）"""
         encoding_map = {
             "UTF-8": "utf-8",
             "GBK": "gbk",
             "ASCII": "ascii"
         }
         self.current_encoding = encoding_map.get(text, "utf-8")
+        for link in self.links.values():
+            link.encoding = self.current_encoding
 
     def refresh_ports(self):
-        """刷新可用串口列表"""
-        self.port_combo.clear()
-        ports = serial.tools.list_ports.comports()
-        for port in ports:
-            self.port_combo.addItem(port.device)
+        """刷新两路串口下拉的可用串口列表"""
+        ports = [port.device for port in serial.tools.list_ports.comports()]
+        for ui in self.car_ui.values():
+            current = ui['port'].currentText()
+            ui['port'].clear()
+            ui['port'].addItems(ports)
+            if current in ports:
+                ui['port'].setCurrentText(current)
 
     def scan_bluetooth_devices(self):
         """扫描蓝牙设备"""
@@ -931,9 +1321,8 @@ class BluetoothDebugTool(QMainWindow):
             self.receive_text.append(f"蓝牙连接失败: {message}")
 
     def on_bluetooth_data_received(self, data):
-        """接收蓝牙数据"""
-        self.receive_text.append(f"[蓝牙] 接收: {data}")
-        self.process_received_data(data)
+        """接收蓝牙数据（仅入日志，不接入对战数据通道，避免与车载串口数据串仓）"""
+        self.append_log('蓝牙', data)
 
     def on_bluetooth_disconnected(self):
         """蓝牙断开连接"""
@@ -942,180 +1331,155 @@ class BluetoothDebugTool(QMainWindow):
         self.bluetooth_connect_btn.setEnabled(True)
         self.receive_text.append("蓝牙连接已断开")
 
-    def toggle_serial_connection(self):
-        """切换串口连接状态"""
-        if self.is_connected:
-            self.disconnect_serial()
-        else:
-            self.connect_serial()
-
-    def connect_serial(self):
-        """连接串口设备"""
-        try:
-            port = self.port_combo.currentText()
-            baudrate = int(self.baud_combo.currentText())
-
-            if not port:
-                QMessageBox.warning(self, "警告", "请选择串口")
-                return
-
-            self.serial_connection = serial.Serial(port, baudrate, timeout=1)
-            self.is_connected = True
-
-            self.connect_btn.setEnabled(False)
-            self.disconnect_btn.setEnabled(True)
-
-            # 启动定时器读取数据
-            self.timer.start(10)  # 每10ms读取一次
-
-            self.receive_text.append(f"已连接到 {port}，波特率 {baudrate}")
-
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"连接失败: {str(e)}")
-
-    # 在 BluetoothDebugTool 类中添加连接状态清理方法
-    def disconnect_serial(self):
-        """断开串口连接"""
-        if self.serial_connection and self.serial_connection.is_open:
-            self.serial_connection.close()
-
-        self.is_connected = False
-        self.timer.stop()
-        self.serial_buffer = ""  # 清空缓冲区
-
-        # 重置所有防抖状态
-        if hasattr(self, 'map_widget') and self.map_widget:
-            self.map_widget.position_state['pending_update'] = False
-            self.map_widget.enemy_state['pending_update'] = False
-
-        self.connect_btn.setEnabled(True)
-        self.disconnect_btn.setEnabled(False)
-
-        self.receive_text.append("已断开串口连接")
-
     def send_data(self):
-        """发送数据"""
-        if not self.is_connected and not self.is_bluetooth_connected:
-            QMessageBox.warning(self, "警告", "未连接设备")
-            return
-
+        """按所选目标发送数据（Car A / Car B / 蓝牙）"""
+        target = self.send_target_combo.currentText()
         try:
             data = self.send_text.toPlainText()
             # 确保发送的数据以\n结尾
             if not data.endswith('\n'):
                 data += '\n'
-            data_bytes = data.encode('utf-8')
-            if self.is_connected and self.serial_connection:
-                self.serial_connection.write(data_bytes)
-                self.receive_text.append(f"[串口] 发送: {data.strip()}")
-            elif self.is_bluetooth_connected and self.bluetooth_connection_worker:
-                self.bluetooth_connection_worker.send_data(data)
-                self.receive_text.append(f"[蓝牙] 发送: {data.strip()}")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"发送失败: {str(e)}")
-
-    def read_serial_data(self):
-        """读取串口数据"""
-        if not self.is_connected or not self.serial_connection:
             return
 
+        if target in ('A', 'B'):
+            link = self.links[target]
+            if not link.is_open:
+                QMessageBox.warning(self, "警告", f"Car {target} 未连接")
+                return
+            if link.send_line(data):
+                self.append_log(target, f"发送: {data.strip()}", LOG_COLOR_SYS)
+            else:
+                QMessageBox.critical(self, "错误", f"Car {target} 发送失败")
+        else:
+            if not self.is_bluetooth_connected or not self.bluetooth_connection_worker:
+                QMessageBox.warning(self, "警告", "未连接蓝牙设备")
+                return
+            self.bluetooth_connection_worker.send_data(data)
+            self.append_log('蓝牙', f"发送: {data.strip()}")
+
+    # ---------- 对战协议 v1：行处理 / 裁判 / 转发 ----------
+    def on_car_line(self, tag, line):
+        """CarLink 收到一条完整行：入日志（[A]蓝 / [B]红）并解析"""
+        self.append_log(tag, line)
+        self.process_line(tag, line)
+
+    def process_line(self, src, line):
+        """按对战协议 v1 解析某车上报的一行数据（src: 'A'/'B'），双车数据互不串仓"""
         try:
-            # 限制每次读取的数据量，避免大量数据处理导致阻塞
-            bytes_to_read = min(self.serial_connection.in_waiting, 1024)  # 限制每次最多读取1024字节
-            if bytes_to_read > 0:
-                data = self.serial_connection.read(bytes_to_read).decode(self.current_encoding, errors='ignore')
-                # 使用 QTimer.singleShot 将数据处理推迟到事件循环
-                QTimer.singleShot(0, lambda: self.process_serial_data(data))
-        except Exception as e:
-            print(f"读取数据错误: {e}")
+            line = line.strip()
+            if not line:
+                return
+            link = self.links.get(src)
+            if link is None:
+                return
 
-    def process_serial_data(self, data):
-        """处理串口数据，以\n为一段数据的结束"""
-        self.serial_buffer += data
-        while '\n' in self.serial_buffer:
-            message, self.serial_buffer = self.serial_buffer.split('\n', 1)
-            if message:
-                self.receive_text.append(f"[串口] 接收: {message.strip()}")
-                self.process_received_data(message.strip())
+            if line.startswith("PID:"):
+                # 解析PID数据 (格式: PID:电机ID,实际值,目标值)
+                pid_parts = line[4:].split(",")
+                if len(pid_parts) >= 2:
+                    motor_id = int(pid_parts[0])
+                    pid_value = float(pid_parts[1])
+                    target_pid_value = 0  # 默认目标值为0
+                    if len(pid_parts) >= 3:
+                        target_pid_value = float(pid_parts[2])
+                    self.pid_widgets[src].update_pid_data(motor_id, pid_value, target_pid_value)
 
-    def process_received_data(self, data):
-        """处理接收到的数据"""
-        try:
-            # 处理多行数据
-            lines = data.split('\n')
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
+            elif line.startswith("RPOS:"):
+                # RPOS:上报位置（谎报），经裁判校验后决定转发或拒收
+                rpos_parts = line[5:].split(",")
+                if len(rpos_parts) >= 2:
+                    x_str = rpos_parts[0].strip()
+                    y_str = rpos_parts[1].strip()
+                    self._handle_rpos(src, x_str, y_str)
 
-                if line.startswith("PID:"):
-                    # 解析PID数据 (格式: PID:电机ID,实际值,目标值)
-                    parts = line[4:]  # 去掉 "PID:" 前缀
-                    pid_parts = parts.split(",")
-                    if len(pid_parts) >= 2:
-                        motor_id = int(pid_parts[0])
-                        pid_value = float(pid_parts[1])
-                        target_pid_value = 0  # 默认目标值为0
-                        if len(pid_parts) >= 3:
-                            target_pid_value = float(pid_parts[2])
-                        self.pid_widget.update_pid_data(motor_id, pid_value, target_pid_value)
-                        print(f"PID数据更新: 电机{motor_id}, 值{pid_value}, 目标值{target_pid_value}")
+            elif line.startswith("POS:"):
+                # POS:实际位置（仅用于裁判校验与真实位置显示，绝不转发给对手）
+                pos_parts = line[4:].split(",")
+                if len(pos_parts) >= 2:
+                    x = float(pos_parts[0])
+                    y = float(pos_parts[1])
+                    link.pos = (x, y)
+                    link.note_pos()
+                    self.map_widget.update_car_position(src, x, y)
 
-                elif line.startswith("POS:"):
-                    # 解析位置数据
-                    parts = line[4:]  # 去掉 "POS:" 前缀
-                    pos_parts = parts.split(",")
-                    if len(pos_parts) >= 2:
-                        x = float(pos_parts[0])
-                        y = float(pos_parts[1])
-                        # 使用防抖更新位置
-                        self.map_widget.update_position(x, y)
+            elif line.startswith("ENEMY:"):
+                # 旧协议字段：修正 off-by-one（应为 line[6:]），仅记录不接入对战通道
+                enemy_parts = line[6:].split(",")
+                if len(enemy_parts) >= 2:
+                    x = float(enemy_parts[0])
+                    y = float(enemy_parts[1])
+                    self.append_log(src, f"[解析] ENEMY {x},{y}（旧协议字段，未接入对战通道）",
+                                    LOG_COLOR_GREY)
 
-                elif line.startswith("ENEMY:"):
-                    # 解析敌人位置数据
-                    parts = line[7:]  # 去掉 "ENEMY:" 前缀
-                    enemy_parts = parts.split(",")
-                    if len(enemy_parts) >= 2:
-                        x = float(enemy_parts[0])
-                        y = float(enemy_parts[1])
-                        # 使用防抖更新敌人位置
-                        self.map_widget.update_enemy_position(x, y)
+            elif line.startswith("YAW:"):
+                # 解析偏航角数据 (格式: YAW:实际值,目标值)
+                yaw_parts = line[4:].split(",")
+                yaw_value = yaw_parts[0]
+                target_yaw_value = 0  # 默认目标值为0
+                if len(yaw_parts) >= 2:
+                    target_yaw_value = yaw_parts[1]
+                try:
+                    yaw_value = float(yaw_value)
+                    target_yaw_value = float(target_yaw_value)
+                    self.pid_widgets[src].update_yaw_data(yaw_value, target_yaw_value)
+                except ValueError:
+                    print(f"无效的偏航角数据: {yaw_value}")
 
-                elif line.startswith("YAW:"):
-                    # 解析偏航角数据 (格式: YAW:实际值,目标值)
-                    parts = line[4:]  # 去掉 "YAW:" 前缀
-                    yaw_parts = parts.split(",")
-                    yaw_value = yaw_parts[0]
-                    target_yaw_value = 0  # 默认目标值为0
-                    if len(yaw_parts) >= 2:
-                        target_yaw_value = yaw_parts[1]
-                    try:
-                        yaw_value = float(yaw_value)
-                        target_yaw_value = float(target_yaw_value)
-                        self.pid_widget.update_yaw_data(yaw_value, target_yaw_value)
-                        print(f"偏航角数据更新: {yaw_value}°, 目标值{target_yaw_value}°")
-                    except ValueError:
-                        print(f"无效的偏航角数据: {yaw_value}")
-
-                elif line.startswith("track_data:"):
-                    try:
-                        # 提取track_data后面的数值
-                        value_str = line[11:]  # 去掉 "track_data:" 前缀
-                        value = int(value_str)
-                        # 转换为16位二进制字符串，然后只取后8位
-                        binary_str = format(value, '016b')
-                        # 只显示后8位
-                        last_8_bits = binary_str[8:]  # 取后8位
-                        # 格式化显示，每4位用空格分隔，提高可读性
-                        formatted_binary = ' '.join([last_8_bits[i:i + 4] for i in range(0, len(last_8_bits), 4)])
-                        self.receive_text.append(f"[解析] track_data: {value} => 后8位二进制: {formatted_binary}")
-                        print(f"track_data解析: {value} => 后8位 {last_8_bits}")
-                    except ValueError:
-                        self.receive_text.append(f"[错误] 无法解析track_data: {line}")
-                        print(f"无效的track_data格式: {line}")
+            elif line.startswith("track_data:"):
+                try:
+                    # 提取track_data后面的数值
+                    value = int(line[11:])
+                    # 转换为16位二进制字符串，然后只取后8位
+                    binary_str = format(value, '016b')
+                    last_8_bits = binary_str[8:]
+                    formatted_binary = ' '.join([last_8_bits[i:i + 4] for i in range(0, len(last_8_bits), 4)])
+                    self.append_log(src, f"[解析] track_data: {value} => 后8位二进制: {formatted_binary}")
+                except ValueError:
+                    self.append_log(src, f"[错误] 无法解析track_data: {line}", LOG_COLOR_WARN)
 
         except Exception as e:
             print(f"解析数据错误: {e}")
+
+    def _handle_rpos(self, src, x_str, y_str):
+        """裁判 + 转发（对战协议 v1 核心）；x_str/y_str 为上报原文坐标"""
+        link = self.links[src]
+        x = float(x_str)
+        y = float(y_str)
+        link.rpos = (x, y)
+        self.map_widget.update_car_report(src, x, y)
+        graph = getattr(self.map_widget, 'graph', None)
+        ok, d, degraded = judge_rpos_ex(link.pos, (x, y), graph)
+        other = 'B' if src == 'A' else 'A'
+
+        if degraded:
+            self.append_log(src, f"RPOS 节点匹配失败，按欧氏距离估算 {d:.2f} 跳，放行",
+                            LOG_COLOR_WARN)
+
+        if not ok:
+            # 超限：回发 ERR:RPOS,<d> 给上报车，不转发，红色告警
+            link.send_line(f"ERR:RPOS,{d}")
+            self.append_log(src,
+                            f"RPOS 超限：图距离 {d} > {RPOS_MAX_HOPS} 跳，"
+                            f"已回发 ERR:RPOS,{d}，未转发",
+                            LOG_COLOR_WARN)
+            return
+
+        # 通过：生成 ORP:x,y 发给另一辆车的串口
+        if not link.is_online():
+            self.append_log(src, "RPOS 校验通过，但该车离线（3 秒无 POS），暂停转发",
+                            LOG_COLOR_GREY)
+            return
+        other_link = self.links[other]
+        if not other_link.is_open:
+            self.append_log(src, f"RPOS 校验通过，但 Car {other} 未连接，未转发",
+                            LOG_COLOR_GREY)
+            return
+        if other_link.send_line(f"ORP:{x_str},{y_str}"):
+            self.append_log(src, f"RPOS 转发给 {other}", LOG_COLOR_SYS)
+        else:
+            self.append_log(src, f"RPOS 转发给 {other} 失败", LOG_COLOR_WARN)
 
     def load_map_file(self):
         """加载地图文件"""
@@ -1129,19 +1493,42 @@ class BluetoothDebugTool(QMainWindow):
                 QMessageBox.critical(self, "错误", "地图文件加载失败")
 
     def test_position(self):
-        """测试位置更新"""
+        """测试位置更新（A/B 各生成真实位置与上报位置，含谎报偏差）"""
         # 随机生成一个测试位置
         import random
-        x = random.uniform(0, 1000)
-        y = random.uniform(0, 1000)
-        self.map_widget.update_position(x, y)
-        self.receive_text.append(f"测试位置: ({x:.2f}, {y:.2f})")
+        for tag in ('A', 'B'):
+            x = random.uniform(0, 1000)
+            y = random.uniform(0, 1000)
+            link = self.links[tag]
+            link.pos = (x, y)
+            link.note_pos()
+            self.map_widget.update_car_position(tag, x, y)
 
-        # 同时生成一个敌人的测试位置
-        enemy_x = random.uniform(0, 1000)
-        enemy_y = random.uniform(0, 1000)
-        self.map_widget.update_enemy_position(enemy_x, enemy_y)
-        self.receive_text.append(f"敌人测试位置: ({enemy_x:.2f}, {enemy_y:.2f})")
+            # 上报位置（谎报）：带随机偏差
+            rx = x + random.uniform(-600, 600)
+            ry = y + random.uniform(-600, 600)
+            link.rpos = (rx, ry)
+            self.map_widget.update_car_report(tag, rx, ry)
+
+            self.append_log(tag, f"测试位置: ({x:.2f}, {y:.2f})，上报: ({rx:.2f}, {ry:.2f})")
+
+    def closeEvent(self, event):
+        """关窗清理：停止状态灯定时器与两路串口，避免关窗崩溃"""
+        try:
+            self.status_timer.stop()
+        except Exception:
+            pass
+        for tag, link in self.links.items():
+            try:
+                link.close()
+            except Exception as e:
+                print(f"关闭 Car {tag} 串口错误: {e}")
+        if self.bluetooth_connection_worker is not None:
+            try:
+                self.bluetooth_connection_worker.stop()
+            except Exception:
+                pass
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":

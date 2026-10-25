@@ -44,6 +44,8 @@ extern UART_HandleTypeDef huart5;
 void n10_init(void);
 void n10_start_motor(void);
 void n10_stop_motor(void);
+// UART5 单字节接收处理：由 BT.c 中唯一的 HAL_UART_RxCpltCallback 分发调用
+void n10_rx_byte(void);
 uint8_t n10_process_frame(N10_PointCloud_FrameTypeDef *frame);
 float n10_get_speed(N10_PointCloud_FrameTypeDef *frame);
 float n10_get_start_angle(N10_PointCloud_FrameTypeDef *frame);

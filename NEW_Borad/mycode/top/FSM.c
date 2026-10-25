@@ -3,6 +3,9 @@
 #include "Lidra.h"
 #include "control.h"
 #include <math.h>
+#include <string.h> // strncmp：对战协议下行解析
+#include <stdlib.h> // strtof：对战协议下行解析
+#include <stdio.h>  // snprintf：对战协议上行组包
 #include "BT.h"
 #include "Sensor.h"
 #include "time.h"
@@ -27,6 +30,12 @@
 
 #define TRACK_INTERVAL 2.0 // 循迹传感器间隔
 #define LP_ALPHA 0.7
+
+// ---------------- 对战协议（与上位机 final.py 对齐） ----------------
+#define POS_SEND_MIN_MS 100       // POS/RPOS 最小发送间隔（ms）
+#define POS_SEND_MAX_MS 200       // 位置无明显变化时的最大发送间隔（ms）
+#define POS_CHANGE_THRESHOLD 20.0f // 位置变化阈值（地图单位，超过则提前发送）
+#define OPPONENT_TIMEOUT_MS 5000  // ORP 超过 5s 未更新则失效
 // 小偷 930.0f, 390.0f, 0.0f    54  地图方向为左 DIRECTION_LEFT 校准点：850.0f, 390.0f
 // 警察 50.0f,  60.0f,  -90.0f  81  地图方向为上 DIRECTION_UP   校准点：50.0f,  230.0f
 // 宝藏 450.0f, 800.0f          5
@@ -121,12 +130,113 @@ void robot_init(RobotController *robot, uint8_t init_id, float init_x, float ini
     robot->enemy_x = -1.0f; // 无效值
     robot->enemy_y = -1.0f;
 
+    // 对战协议字段初始化
+    robot->oppo_x = -1.0f;
+    robot->oppo_y = -1.0f;
+    robot->oppo_valid = 0;
+    robot->oppo_last_ms = 0;
+    robot->last_pos_send_ms = 0;
+    robot->last_sent_x = init_x;
+    robot->last_sent_y = init_y;
+    robot->pos_sent_once = 0;
+
     robot->loc_module.current_calib.x = INIT_CALIB_X;
     robot->loc_module.current_calib.y = INIT_CALIB_Y;
 
 #if DEBUG_PRINT
     log_print("FSM->init_tartget: (%.1f,%.1f)\n", robot->target_x, robot->target_y);
 #endif
+}
+
+/*
+ * 对战协议接入（主循环上下文，非中断）：
+ *  1) 轮询蓝牙下行整行，解析 ORP:（对手上报位置）/ ERR:RPOS,（上报被拒日志）
+ *  2) ORP 超过 OPPONENT_TIMEOUT_MS(5s) 未更新 → oppo_valid = 0
+ *  3) 将对手位置转发给 na.c 策略层（供鲁棒最坏情况目标选择）
+ *  4) 按 100~200ms / 位置变化阈值节流发送 POS:（真实位置）与 RPOS:（策略谎报位置）
+ * 注意：本函数内的发送均为阻塞发送，禁止移入任何临界区/中断
+ */
+static void robot_protocol_update(RobotController *robot, const Pose *pose)
+{
+    char line[BT_LINE_MAX];
+
+    // ---- 1) 下行：取整行并解析（ORP / ERR:RPOS） ----
+    while (bt_read_line(line, (int)sizeof(line)) > 0)
+    {
+        if (strncmp(line, "ORP:", 4) == 0)
+        {
+            char *end1 = NULL;
+            float ox = strtof(line + 4, &end1);
+            if (end1 != (line + 4) && *end1 == ',')
+            {
+                char *end2 = NULL;
+                float oy = strtof(end1 + 1, &end2);
+                if (end2 != (end1 + 1))
+                {
+                    ENTER_CRITICAL();
+                    robot->oppo_x = ox;
+                    robot->oppo_y = oy;
+                    robot->oppo_valid = 1;
+                    robot->oppo_last_ms = timer_get_ms();
+                    EXIT_CRITICAL();
+#if DEBUG_PRINT
+                    log_print("FSM->ORP: (%.1f,%.1f)\r\n", ox, oy);
+#endif
+                    continue;
+                }
+            }
+            log_print("FSM->bad ORP line: %s\r\n", line);
+        }
+        else if (strncmp(line, "ERR:RPOS,", 9) == 0)
+        {
+            // 平台拒绝本次 RPOS（仅日志）
+            log_print("FSM->platform rejected RPOS: %s\r\n", line);
+        }
+        // 其余下行（含遥测回显等）一律忽略
+    }
+
+    // ---- 2) ORP 超时失效 ----
+    uint32_t now = timer_get_ms();
+    ENTER_CRITICAL();
+    if (robot->oppo_valid &&
+        GetTickDiffMs(robot->oppo_last_ms, now) > OPPONENT_TIMEOUT_MS)
+    {
+        robot->oppo_valid = 0;
+    }
+    float oppo_x = robot->oppo_x;
+    float oppo_y = robot->oppo_y;
+    uint8_t oppo_valid = robot->oppo_valid;
+    EXIT_CRITICAL();
+
+    // ---- 3) 转发给策略层（纯数据赋值，供 navigate() 内鲁棒决策使用） ----
+    na_set_opponent_report(oppo_x, oppo_y, oppo_valid);
+
+    // ---- 4) 节流发送 POS / RPOS ----
+    now = timer_get_ms();
+    float dx = pose->x - robot->last_sent_x;
+    float dy = pose->y - robot->last_sent_y;
+    float moved = sqrtf(dx * dx + dy * dy);
+    uint32_t elapsed = GetTickDiffMs(robot->last_pos_send_ms, now);
+    if (!robot->pos_sent_once ||
+        (elapsed >= POS_SEND_MIN_MS &&
+         (moved >= POS_CHANGE_THRESHOLD || elapsed >= POS_SEND_MAX_MS)))
+    {
+        float spoof_x = pose->x;
+        float spoof_y = pose->y;
+        strategy_spoof_pos(pose->x, pose->y, oppo_x, oppo_y, oppo_valid,
+                           &spoof_x, &spoof_y);
+
+        char buf[48];
+        snprintf(buf, sizeof(buf), "POS:%.1f,%.1f", pose->x, pose->y);
+        bt_send_line(buf);
+        snprintf(buf, sizeof(buf), "RPOS:%.1f,%.1f", spoof_x, spoof_y);
+        bt_send_line(buf);
+
+        robot->last_pos_send_ms = now;
+        robot->last_sent_x = pose->x;
+        robot->last_sent_y = pose->y;
+        robot->pos_sent_once = 1;
+    }
 }
 
 void robot_update(RobotController *robot)
@@ -229,6 +339,10 @@ void robot_update(RobotController *robot)
 #if DEBUG_PRINT
     log_print("FSM->calibrated_state:%d\n", robot->is_calibrated);
 #endif
+
+    // 对战协议接入：解析 ORP/ERR、ORP 超时、节流上报 POS/RPOS
+    // 并把对手位置转发给策略层（主循环上下文，非中断）
+    robot_protocol_update(robot, &current_pose);
 
     // 状态机处理
     switch (robot->state)

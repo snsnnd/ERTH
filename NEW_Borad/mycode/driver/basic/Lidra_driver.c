@@ -332,17 +332,14 @@ static float n10_parse_angle(uint8_t angle_h, uint8_t angle_l)
     return (float)angle_raw / 100.0f;
 }
 
-// -------------------------- HAL中断回调函数 --------------------------
+// -------------------------- UART接收处理 --------------------------
 /**
- * @brief UART接收完成回调（HAL库机制）
- * 每次接收1字节后触发，写入环形缓冲区
+ * @brief UART5 单字节接收处理（由 BT.c 中全工程唯一的
+ *        HAL_UART_RxCpltCallback 按 huart->Instance==USART5 分发调用）
+ * 写入环形缓冲区并重启中断接收（HAL库需手动重启）
  */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+void n10_rx_byte(void)
 {
-    if (huart == &huart5)
-    {
-        n10_ringbuf_write(&n10_ring_buf, rx_temp_byte);
-        // 重新开启中断接收（HAL库需手动重启）
-        HAL_UART_Receive_IT(&huart5, &rx_temp_byte, 1);
-    }
+    n10_ringbuf_write(&n10_ring_buf, rx_temp_byte);
+    HAL_UART_Receive_IT(&huart5, &rx_temp_byte, 1);
 }

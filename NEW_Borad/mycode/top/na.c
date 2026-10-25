@@ -599,6 +599,388 @@ bool select_safe_target(uint8_t enemy_node_id, uint8_t *safe_node_id)
     return true;
 }
 
+/* ==================== 对战协议 → 策略层（ORP 转发） ====================
+ * 由 FSM 主循环 robot_protocol_update() 每次更新（含 5s 超时清零）
+ */
+static float s_oppo_report_x = -1.0f;
+static float s_oppo_report_y = -1.0f;
+static uint8_t s_oppo_report_valid = 0;
+
+void na_set_opponent_report(float map_x, float map_y, uint8_t valid)
+{
+    s_oppo_report_x = map_x;
+    s_oppo_report_y = map_y;
+    s_oppo_report_valid = (valid != 0) ? 1u : 0u;
+}
+
+/* ====== 选手策略区 STRATEGY：比赛时可整体替换本区实现 ======
+ * 依赖：仅 map.c 图数据 API + 标准库（零 HAL 依赖，可 host gcc 单测）
+ * 距离度量：图 BFS 跳数（每条边权重视为 1，不使用边 distance）
+ */
+#define STRATEGY_HOPS 2              // 最大图跳数（谎报偏置范围 & 对手候选集合）
+#define STRATEGY_MAX_CAND 20         // 2 跳候选集合上限（图度≤4，实际上限 1+4+12=17）
+#define STRATEGY_DIST_INF ((int16_t)0x7FFF) // 不可达标记
+
+// 距离表：sb_dist_from_cand[k] = 候选 S[k] 为源的全图 BFS 距离
+static int16_t sb_dist_from_cand[STRATEGY_MAX_CAND][MAX_NODE_ID];
+static int16_t sb_dist_scratch[MAX_NODE_ID]; // 单次 BFS 暂存（非重入，主循环单线程调用）
+
+/**
+ * @brief  校验节点 id 并返回节点指针（NULL=非法）
+ * 地图 id 从 2 开始（0/1 被跳过，见 map.c SKIP_1/SKIP_2）；
+ * 幻影/映射错位 id 通过 node_id 回读比对剔除。
+ * 邻居槽中可能出现 -1（→(uint8_t)255）、0、不存在的 id，均在此被拒绝 → 防越界
+ */
+static Node *sb_valid_node(uint8_t id)
+{
+    if (id < 2 || id >= MAX_NODE_ID)
+    {
+        return NULL;
+    }
+    Node *n = get_node_by_id(id);
+    if (n == NULL || n->node_id != id)
+    {
+        return NULL;
+    }
+    return n;
+}
+
+/**
+ * @brief  距坐标最近的有效节点（跳过 node_count 中零初始化的幻影槽位）
+ * @retval node_id，0=失败
+ */
+static uint8_t sb_closest_node(float x_map, float y_map)
+{
+    float best = FLT_MAX;
+    uint8_t best_id = 0;
+    for (uint8_t i = 0; i < global_map.node_count; i++)
+    {
+        Node *n = &global_map.nodes[i];
+        if (n->node_id < 2 || n->node_id >= MAX_NODE_ID)
+        {
+            continue; // 幻影节点（node_count 计数含零初始化槽位）
+        }
+        float dx = x_map - n->x;
+        float dy = y_map - n->y;
+        float d = dx * dx + dy * dy;
+        if (d < best)
+        {
+            best = d;
+            best_id = n->node_id;
+        }
+    }
+    return best_id;
+}
+
+/**
+ * @brief  单源 BFS（跳数距离，边权=1）
+ * @param  dist: 输出数组（按 node_id 索引，长度 MAX_NODE_ID），不可达=STRATEGY_DIST_INF
+ * @param  max_hops: >=0 限制展开跳数；<0 不限制
+ */
+static void sb_bfs(uint8_t src, int16_t *dist, int max_hops)
+{
+    for (uint8_t i = 0; i < MAX_NODE_ID; i++)
+    {
+        dist[i] = STRATEGY_DIST_INF;
+    }
+    if (sb_valid_node(src) == NULL)
+    {
+        return;
+    }
+
+    uint8_t queue[MAX_NODE_ID];
+    uint8_t head = 0, tail = 0;
+    dist[src] = 0;
+    queue[tail++] = src;
+
+    while (head < tail)
+    {
+        uint8_t id = queue[head++];
+        Node *n = sb_valid_node(id);
+        if (n == NULL)
+        {
+            continue; // 队列内均为校验过的 id（双保险）
+        }
+        if (max_hops >= 0 && dist[id] >= max_hops)
+        {
+            continue;
+        }
+        uint8_t cnt = n->neighbor_count;
+        if (cnt > 4)
+        {
+            cnt = 4; // 邻居槽位固定 4，防 neighbor_count 异常
+        }
+        for (uint8_t i = 0; i < cnt; i++)
+        {
+            uint8_t nb = (uint8_t)n->neighbors[i]; // -1 → 255
+            if (sb_valid_node(nb) == NULL)
+            {
+                continue; // 过滤 -1/0/不存在的 id：防越界与幻影节点
+            }
+            if (dist[nb] != STRATEGY_DIST_INF)
+            {
+                continue; // 已访问（也保证每个 id 只入队一次）
+            }
+            dist[nb] = (int16_t)(dist[id] + 1);
+            queue[tail++] = nb;
+        }
+    }
+}
+
+/**
+ * @brief  收集 src ±STRATEGY_HOPS 跳候选集合（含 src 自身），id 升序
+ * @retval 集合大小（0=失败）
+ */
+static int sb_collect_hops(uint8_t src, uint8_t *out, int max_out)
+{
+    sb_bfs(src, sb_dist_scratch, STRATEGY_HOPS);
+    if (sb_dist_scratch[src] == STRATEGY_DIST_INF)
+    {
+        return 0;
+    }
+    int n = 0;
+    for (uint8_t id = 2; id < MAX_NODE_ID && n < max_out; id++)
+    {
+        if (sb_dist_scratch[id] != STRATEGY_DIST_INF)
+        {
+            out[n++] = id;
+        }
+    }
+    return n;
+}
+
+/**
+ * @brief  两节点坐标的欧氏距离（-1=任一节点非法）
+ */
+static float sb_euclid(uint8_t a, uint8_t b)
+{
+    Node *na = sb_valid_node(a);
+    Node *nb = sb_valid_node(b);
+    if (na == NULL || nb == NULL)
+    {
+        return -1.0f;
+    }
+    float dx = na->x - nb->x;
+    float dy = na->y - nb->y;
+    return sqrtf(dx * dx + dy * dy);
+}
+
+/**
+ * @brief  1) 谎报位置生成：在真实位置 ±STRATEGY_HOPS 图跳内选一个偏置节点
+ *         （朝远离对手的图跳方向偏移，最远者优先），输出其坐标。
+ *  结构上保证：偏置节点 ∈ BFS≤2(真实最近节点) → 谎报位置与真实位置
+ *  的图距离恒 ≤2 节点，平台按图距离校验 RPOS 必过。
+ *  对手无效 / 最近节点失败 / 无需偏置时输出真实位置（图距离 0）。
+ */
+void strategy_spoof_pos(float true_x, float true_y,
+                        float oppo_x, float oppo_y, uint8_t oppo_valid,
+                        float *spoof_x, float *spoof_y)
+{
+    if (spoof_x == NULL || spoof_y == NULL)
+    {
+        return;
+    }
+    *spoof_x = true_x;
+    *spoof_y = true_y; // 默认：不谎报
+
+    if (!oppo_valid)
+    {
+        return;
+    }
+
+    uint8_t true_node = sb_closest_node(true_x, true_y);
+    uint8_t oppo_node = sb_closest_node(oppo_x, oppo_y);
+    if (true_node == 0 || oppo_node == 0)
+    {
+        return;
+    }
+
+    // 候选 = 真实位置 ±2 跳内的节点（含自身）
+    uint8_t cand[STRATEGY_MAX_CAND];
+    int cand_n = sb_collect_hops(true_node, cand, STRATEGY_MAX_CAND);
+    if (cand_n <= 0)
+    {
+        return;
+    }
+
+    // 对手节点全图 BFS 距离（一次），用于"朝远离对手方向偏移"
+    int16_t dist_to_oppo[MAX_NODE_ID];
+    sb_bfs(oppo_node, dist_to_oppo, -1);
+
+    uint8_t best = true_node;
+    int best_hop = -1;
+    float best_eucl = -1.0f;
+    for (int i = 0; i < cand_n; i++)
+    {
+        uint8_t c = cand[i];
+        int hop = dist_to_oppo[c];            // 越大越远离对手（不可达=INF 最远）
+        float eucl = sb_euclid(c, oppo_node); // 同跳数时用欧氏距离决胜
+        if (hop > best_hop || (hop == best_hop && eucl > best_eucl))
+        {
+            best = c;
+            best_hop = hop;
+            best_eucl = eucl;
+        }
+    }
+
+    if (best == true_node)
+    {
+        return; // 最偏节点就是真实节点：报真实坐标
+    }
+    Node *bn = sb_valid_node(best);
+    if (bn == NULL)
+    {
+        return;
+    }
+    *spoof_x = bn->x;
+    *spoof_y = bn->y;
+}
+
+/**
+ * @brief  2) 鲁棒最坏情况目标选择（图 BFS 跳数距离）
+ *  PURSUIT(追击): S = 对手上报节点 BFS≤2 候选集（含自身）
+ *                  t* = argmin_{t∈S} [ dist(我→t) + max_{s∈S} dist(t,s) ]  (minimax)
+ *  EVADE(躲避)  : t* = argmax_{t∈全图有效节点} min_{s∈S} dist(t,s)          (maximin)
+ *  数据无效 / 全部不可达 → 返回 0，由调用方回落原 navigate 逻辑
+ */
+int strategy_select_target(NavigationMode mode,
+                           float self_x, float self_y,
+                           float oppo_x, float oppo_y, uint8_t oppo_valid,
+                           uint8_t *out_target_node_id)
+{
+    if (out_target_node_id == NULL)
+    {
+        return 0;
+    }
+    *out_target_node_id = 0;
+
+    if (!oppo_valid || (mode != MODE_PURSUIT && mode != MODE_EVADE))
+    {
+        return 0;
+    }
+
+    uint8_t self_node = sb_closest_node(self_x, self_y);
+    uint8_t oppo_node = sb_closest_node(oppo_x, oppo_y);
+    if (self_node == 0 || oppo_node == 0)
+    {
+        return 0;
+    }
+
+    // S = 对手 ±2 跳候选集合（含对手节点自身）
+    uint8_t S[STRATEGY_MAX_CAND];
+    int s_n = sb_collect_hops(oppo_node, S, STRATEGY_MAX_CAND);
+    if (s_n <= 0)
+    {
+        return 0;
+    }
+
+    // 预计算 S 内每个节点为源的全图 BFS 距离表
+    for (int k = 0; k < s_n; k++)
+    {
+        sb_bfs(S[k], sb_dist_from_cand[k], -1);
+    }
+
+    if (mode == MODE_PURSUIT)
+    {
+        // minimax: t* = argmin_{t∈S} [ dist(self→t) + max_{s∈S} dist(t,s) ]
+        sb_bfs(self_node, sb_dist_scratch, -1); // scratch: dist(self→·)
+
+        int best_score = INT32_MAX;
+        int best_self = INT32_MAX;
+        uint8_t best_t = 0;
+        for (int i = 0; i < s_n; i++)
+        {
+            uint8_t t = S[i];
+            int d_self = sb_dist_scratch[t];
+            if (d_self == STRATEGY_DIST_INF)
+            {
+                continue; // 我到不了 t：跳过
+            }
+            int worst = 0;
+            for (int j = 0; j < s_n; j++)
+            {
+                int d = sb_dist_from_cand[i][S[j]];
+                if (d == STRATEGY_DIST_INF)
+                {
+                    worst = STRATEGY_DIST_INF;
+                    break; // t 覆盖不了某个最坏候选：跳过
+                }
+                if (d > worst)
+                {
+                    worst = d;
+                }
+            }
+            if (worst == STRATEGY_DIST_INF)
+            {
+                continue;
+            }
+            int score = d_self + worst;
+            if (score < best_score || (score == best_score && d_self < best_self))
+            {
+                best_score = score;
+                best_self = d_self;
+                best_t = t;
+            }
+        }
+        if (best_t == 0)
+        {
+            return 0; // 无可达候选 → 回落原逻辑
+        }
+        *out_target_node_id = best_t;
+        return 1;
+    }
+
+    // MODE_EVADE: maximin t* = argmax_t min_{s∈S} dist(t,s)（候选=全图有效节点）
+    uint8_t best_t = 0;
+    int best_min = -1;
+    float best_eucl = -1.0f;
+    for (uint8_t i = 0; i < global_map.node_count; i++)
+    {
+        Node *n = &global_map.nodes[i];
+        if (n->node_id < 2 || n->node_id >= MAX_NODE_ID)
+        {
+            continue; // 跳过幻影节点
+        }
+        uint8_t t = n->node_id;
+
+        int m = STRATEGY_DIST_INF;
+        for (int j = 0; j < s_n; j++)
+        {
+            int d = sb_dist_from_cand[j][t];
+            if (d < m)
+            {
+                m = d;
+            }
+        }
+        if (m == STRATEGY_DIST_INF)
+        {
+            continue; // 与对手候选集完全不连通：不可用
+        }
+        if (m > best_min)
+        {
+            best_min = m;
+            best_t = t;
+            best_eucl = sb_euclid(t, oppo_node);
+        }
+        else if (m == best_min)
+        {
+            float e = sb_euclid(t, oppo_node); // 同分：欧氏离对手更远者优先
+            if (e > best_eucl)
+            {
+                best_eucl = e;
+                best_t = t;
+            }
+        }
+    }
+    if (best_t == 0)
+    {
+        return 0;
+    }
+    *out_target_node_id = best_t;
+    return 1;
+}
+/* ====== 策略区结束 ====== */
+
 bool navigate(float self_x, float self_y, float enemy_x, float enemy_y, float target_x, float target_y, NavigationMode mode, Direction *direction)
 {
     if (direction == NULL || !map_validate(&global_map))
@@ -634,9 +1016,30 @@ bool navigate(float self_x, float self_y, float enemy_x, float enemy_y, float ta
     uint8_t target_node_id;
     map_clear_danger_zone(&global_map);
 
+#if STRATEGY_ROBUST_WORST
+    // 鲁棒最坏情况决策：ORP 对手上报有效时，PURSUIT/EVADE 优先用策略区目标
+    // （失败则回落各模式原有逻辑；TREASURE 不受影响）
+    uint8_t robust_target_id = 0;
+    uint8_t robust_ok = 0;
+    if ((mode == MODE_PURSUIT || mode == MODE_EVADE) &&
+        strategy_select_target(mode, self_x, self_y,
+                               s_oppo_report_x, s_oppo_report_y,
+                               s_oppo_report_valid, &robust_target_id))
+    {
+        robust_ok = 1;
+    }
+#endif
+
     switch (mode)
     {
     case MODE_PURSUIT:
+#if STRATEGY_ROBUST_WORST
+        if (robust_ok)
+        {
+            target_node_id = robust_target_id;
+            break;
+        }
+#endif
         if (!has_enemy)
         {
 #if DEBUG_PRINT
@@ -647,6 +1050,13 @@ bool navigate(float self_x, float self_y, float enemy_x, float enemy_y, float ta
         target_node_id = enemy_node_id;
         break;
     case MODE_EVADE:
+#if STRATEGY_ROBUST_WORST
+        if (robust_ok)
+        {
+            target_node_id = robust_target_id;
+            break;
+        }
+#endif
         if (!has_enemy)
         {
 #if DEBUG_PRINT
