@@ -215,35 +215,34 @@ static bool reconstruct_path(uint8_t came_from[], uint8_t current_node_id, uint8
         return true;
     }
 
-    uint8_t next_node_id;
-
-    // 特殊处理：如果是起点节点，查找以它为前驱的后继节点
-    if (came_from[current_node_id] == INVALID_NODE_ID)
+    // 回溯修复：从目标节点沿 came_from（父指针）回溯到起点，得到
+    // goal→…→start 的逆序路径，再反转取路径第一步（起点 → 起点在最优
+    // 路径上的后继）计算行进方向；旧实现从起点向后找“前驱是起点”的
+    // 节点，既可能选中不在最终路径上的分支，方向语义也是反的。
+    uint8_t path[MAX_NODES];
+    uint16_t path_len = 0;
+    uint8_t walk_id = target_node_id;
+    while (walk_id != INVALID_NODE_ID && walk_id < MAX_NODES && path_len < MAX_NODES)
     {
-        // 遍历寻找“前驱是当前节点”的节点（即后继节点）
-        next_node_id = INVALID_NODE_ID;
-        for (uint16_t i = 0; i < MAX_NODES; i++)
+        path[path_len++] = walk_id;
+        if (walk_id == current_node_id)
         {
-            if (came_from[i] == current_node_id)
-            {
-                next_node_id = i;
-                break; // 找到第一个后继节点（路径中的下一步）
-            }
+            break; // 已回溯到起点
         }
+        walk_id = came_from[walk_id];
+    }
 
-        if (next_node_id == INVALID_NODE_ID)
-        {
+    // 必须完整回溯到起点，且路径至少包含起点与其后继两个节点
+    if (path_len < 2 || path[path_len - 1] != current_node_id)
+    {
 #if DEBUG_PRINT
-            log_print("na->No successor node found for start node (ID=%d)\r\n", current_node_id);
+        log_print("na->Path backtracking failed: %d -> %d\r\n", current_node_id, target_node_id);
 #endif
-            return false;
-        }
+        return false;
     }
-    else
-    {
-        // 非起点节点，直接取前驱作为下一步（原逻辑）
-        next_node_id = came_from[current_node_id];
-    }
+
+    // 反转后取第一步的后继节点（path[path_len-1] 即起点 current_node_id）
+    uint8_t next_node_id = path[path_len - 2];
 
     // 检查后继节点有效性
     if (next_node_id == INVALID_NODE_ID)

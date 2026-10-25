@@ -173,20 +173,32 @@ void bt_send_line(const char *s)
 /**
  * @brief  取出一整行接收数据（去 '\r'/'\n'），主循环上下文调用
  * @retval 行长度，0 表示无数据
+ * @note   共享索引 bt_line_head/bt_line_tail 已声明 volatile；
+ *         主循环侧读取/更新用临界区快照（中断侧写入单字节索引本身原子，无需再进临界区）
  */
 int bt_read_line(char *out, int max)
 {
+    uint8_t tail, head;
+
     if (out == NULL || max <= 0)
     {
         return 0;
     }
-    if (bt_line_tail == bt_line_head)
+
+    // 临界区快照共享索引：避免读取 head/tail 时被中断的写入打断（只包最小片段）
+    __disable_irq();
+    tail = bt_line_tail;
+    head = bt_line_head;
+    __enable_irq();
+
+    if (tail == head)
     {
         return 0; // 队列空
     }
     __DMB();
 
-    const char *line = (const char *)bt_line_q[bt_line_tail];
+    // 读取快照槽位：中断只会写 head 槽（head != tail），不会动 tail 槽，故拷贝期间无需关中断
+    const char *line = (const char *)bt_line_q[tail];
     int n = 0;
     while (n < max - 1)
     {
@@ -202,7 +214,10 @@ int bt_read_line(char *out, int max)
 
     // 无论是否截断，整行按一个槽位消费（协议行 <40B << max，正常不会截断）
     __DMB();
+    // tail 的读-改-写在临界区内完成，防止中断在此期间读到中间状态
+    __disable_irq();
     bt_line_tail = (uint8_t)((bt_line_tail + 1) % BT_RX_LINE_QUEUE);
+    __enable_irq();
     return n;
 }
 

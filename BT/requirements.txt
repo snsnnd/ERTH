@@ -1,0 +1,7 @@
+# 依赖按 final.py 的实际 import 列出（标准库 sys/json/re/struct/time/asyncio/html 不列）
+PyQt5>=5.15,<6
+pyserial>=3.5,<4
+pyqtgraph>=0.13
+# 可选：蓝牙扫描/连接功能（未安装时 final.py 自动降级为仅串口模式）
+bleak>=0.21
+# 注：qasync 未被 final.py import，故不列入

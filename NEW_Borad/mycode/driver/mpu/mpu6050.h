@@ -58,7 +58,7 @@ uint8_t mpu6050_init(void);
 void mpu6050_get_acc(int16_t *AccX, int16_t *AccY, int16_t *AccZ);
 void mpu6050_get_gyro(int16_t *GyroX, int16_t *GyroY, int16_t *GyroZ);
 float mpu6050_acc_transition(int16_t acc_value);
-float mpu6050_gyro_transition(int16_t gyro_value);
+float mpu6050_gyro_transition(int16_t gyro_value); // 陀螺仪原始值 → rad/s（全工程单位契约：rad/s）
 
 /**
  * @brief  陀螺仪零漂校准（自动计算零偏）

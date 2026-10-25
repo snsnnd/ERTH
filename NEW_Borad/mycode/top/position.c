@@ -227,7 +227,9 @@ void localization_init(LocalizationModule *loc,
     log_print("pos->The MPU data initialization has been completed\n");
 #endif
     mpu6050_calibrate_gyro(loc->gyro_offset, 5000);
+#if DEBUG_PRINT
     log_print("mpu6050_calibrate_gyro:%f\n", loc->gyro_offset[2]);
+#endif
 
     ComplementaryFilter_Init(&loc->yaw_attitude, loc->gyro_offset);
     loc->yaw_attitude.yaw = init_theta; // 设置初始偏航角
@@ -333,10 +335,6 @@ void localization_update(LocalizationModule *loc)
     log_print("pos->Points update poses has update\n");
 #endif
 
-    // 计算轮子-based的角度测量
-    float delta_theta_wheel = omega_wheels * dt;
-    float wheel_based_theta = constrain_angle(loc->current_pose.theta + delta_theta_wheel);
-
     // 构造互补滤波所需的传感器数据（X右、Y前、Z上）
     SensorData sensor_data = {0};
     // 1. 填充实际加速度计数据（X右、Y前、Z上，单位：m/s²）
@@ -387,20 +385,30 @@ void localization_update(LocalizationModule *loc)
     log_print("YAW:%f,1.5708\n", loc->yaw_attitude.yaw);
 #endif
 
-    // 位置积分（使用中点theta）
+    // 位置积分（使用中点theta：基于本周期旧 theta，保持中点欧拉语义）
     float mid_theta = constrain_angle(loc->current_pose.theta - (mid_omega * dt / 2.0f));
-    float robot_dx = mid_vx * dt;
+    float robot_dx = mid_vx * dt; // 米（轮速单位 m/s）
     float robot_dy = mid_vy * dt;
     float global_dx, global_dy;
     kinematics_robot_to_global(robot_dx, robot_dy, mid_theta, &global_dx, &global_dy);
-    loc->current_pose.x += global_dx;
-    loc->current_pose.y += global_dy;
+    // 积分结果为米，current_pose 为地图单位（1 地图单位=MAP_SCALE=0.01m），
+    // 必须经 real_to_map() 换算后再累加，否则坐标差 100 倍
+    loc->current_pose.x += real_to_map(global_dx);
+    loc->current_pose.y += real_to_map(global_dy);
+
+    // 位置积分已用完旧 theta，之后才把融合（并约束到 [-π,π]）的偏航角
+    // 写回位姿朝向（以陀螺+加速度计融合 yaw 为准）
+    loc->current_pose.theta = loc->yaw_attitude.yaw;
 #if DEBUG_PRINT
-    log_print("pos->position has update x:%.1f y:%.1f\n", loc->current_pose.x, loc->current_pose.y);
+    log_print("pos->position has update x:%.1f y:%.1f theta:%.1f\n", loc->current_pose.x, loc->current_pose.y, loc->current_pose.theta);
 #endif
 }
 
 // 获取当前位姿
+// 注意：本函数会被 FSM 在临界区内调用，仅做数据复制，
+// 禁止在此调用 log_print（阻塞串口输出，且原硬编码
+// ENEMY:300.0,400.0 为假数据）。POS/RPOS 由 FSM 节流发送，
+// PID/ENEMY 遥测统一在 robot_protocol_update 中随节流块上报。
 void localization_get_pose(LocalizationModule *loc, Pose *pose)
 {
     if (loc == NULL || pose == NULL)
@@ -411,20 +419,5 @@ void localization_get_pose(LocalizationModule *loc, Pose *pose)
     pose->vx = loc->current_pose.vx;
     pose->vy = loc->current_pose.vy;
     pose->omega = loc->current_pose.omega;
-    log_print("POS:%f,%f\nYAW:%f,0.0\nENEMY:300.0,400.0\nPID:0,%f,0.0\nPID:1,%f,0.0,\nPID:2,%f,0.0\nPID:3,%f,0.0\n",
-              loc->current_pose.x, loc->current_pose.y, loc->current_pose.theta, loc->wheel_speeds.lf_speed, loc->wheel_speeds.rf_speed, loc->wheel_speeds.lb_speed, loc->wheel_speeds.rb_speed);
 }
 
-// float get_yaw_angle(Pose pose)
-// {
-//     float current_yaw;
-
-//     // 进入临界区：禁用中断，避免读取时被中断更新theta
-//     ENTER_CRITICAL();
-//     // 读取全局位姿中的偏航角，并确保范围正确（双重保险）
-//     current_yaw = constrain_angle(pose.theta);
-//     // 退出临界区：恢复中断
-//     EXIT_CRITICAL();
-
-//     return current_yaw;
-// }

@@ -1,6 +1,7 @@
 #include "kinematics.h"
 #include "arm_math.h"
 #include <stdint.h>
+#include <math.h> // isnan：C99 中为 math.h 宏，缺失会退化为隐式函数声明（链接隐患）
 #include "delay.h"
 #include "BT.h"
 

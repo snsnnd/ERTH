@@ -1,5 +1,6 @@
 #include "utils.h"
 #include <stdint.h>
+#include <math.h> // isnan：C99 中为 math.h 宏，缺失会退化为隐式函数声明（链接隐患）
 #include "BT.h"
 
 // 快速平方根（Quake III算法，单精度）

@@ -7,17 +7,15 @@
 #include <stdlib.h> // strtof：对战协议下行解析
 #include <stdio.h>  // snprintf：对战协议上行组包
 #include "BT.h"
-#include "Sensor.h"
+#include "sensor.h" // 原 "Sensor.h" 与磁盘文件名 sensor.h 大小写不符（Linux 构建失败）
 #include "time.h"
 #include "delay.h"
 #include "tim.h"
-#include "bee.h"
+#include "motor.h" // motor_init：电机 PWM 通道初始化（HAL_TIM_PWM_Start）
 
-#define M_PI 3.14159265358979323846f
+// 注：原 #define M_PI 已删除——本文件无 M_PI 使用，且 math.h（POSIX/newlib）
+// 可能已定义 M_PI（double 版本），重复定义会触发重定义冲突
 #define MAX_TURN_TIME 5.0f // 最大转向时间（秒），防止异常卡死
-#define DEG2RAD 0.0174533f // 角度转弧度（π/180）
-#define RAD2DEG 57.2958f   // 弧度转角度（180/π）
-
 #define INIT_X 930.0f
 #define INIT_Y 390.0f
 #define INIT_T 0.0f
@@ -37,7 +35,7 @@
 #define POS_CHANGE_THRESHOLD 20.0f // 位置变化阈值（地图单位，超过则提前发送）
 #define OPPONENT_TIMEOUT_MS 5000  // ORP 超过 5s 未更新则失效
 // 小偷 930.0f, 390.0f, 0.0f    54  地图方向为左 DIRECTION_LEFT 校准点：850.0f, 390.0f
-// 警察 50.0f,  60.0f,  -90.0f  81  地图方向为上 DIRECTION_UP   校准点：50.0f,  230.0f
+// 警察 50.0f,  60.0f,  -1.5708f 81  地图方向为上 DIRECTION_UP   校准点：50.0f,  230.0f（初始角为弧度：-90°=-π/2=-1.5708）
 // 宝藏 450.0f, 800.0f          5
 
 #define ENTER_CRITICAL()                          \
@@ -91,7 +89,7 @@ void robot_init(RobotController *robot, uint8_t init_id, float init_x, float ini
     // 初始化状态
     robot->state = ROBOT_NAVIGATING;
     robot->nav_mode = MODE_TREASURE;
-    if ((TARGET_X == 0.0f) && (TARGET_Y == 0.0f))
+    if ((target_x == 0.0f) && (target_y == 0.0f))
     {
         robot->has_target = 0;
     }
@@ -140,8 +138,16 @@ void robot_init(RobotController *robot, uint8_t init_id, float init_x, float ini
     robot->last_sent_y = init_y;
     robot->pos_sent_once = 0;
 
-    robot->loc_module.current_calib.x = INIT_CALIB_X;
-    robot->loc_module.current_calib.y = INIT_CALIB_Y;
+    // 校准点兜底：localization_init 已通过 map_globalmap_find_next_calib
+    // 查找地图校准点，找到时 current_calib 即为该点；仅当未找到（保持
+    // localization_init 写入的初始值 (0,0)，地图中不存在 (0,0) 节点，可作
+    // “未找到”哨兵）时才用宏值兜底，避免覆盖找到的校准点
+    if (robot->loc_module.current_calib.x == 0.0f &&
+        robot->loc_module.current_calib.y == 0.0f)
+    {
+        robot->loc_module.current_calib.x = INIT_CALIB_X;
+        robot->loc_module.current_calib.y = INIT_CALIB_Y;
+    }
 
 #if DEBUG_PRINT
     log_print("FSM->init_tartget: (%.1f,%.1f)\n", robot->target_x, robot->target_y);
@@ -232,6 +238,36 @@ static void robot_protocol_update(RobotController *robot, const Pose *pose)
         snprintf(buf, sizeof(buf), "RPOS:%.1f,%.1f", spoof_x, spoof_y);
         bt_send_line(buf);
 
+        // 遥测：PID（四轮实际轮速，供上位机 PIDWidget）与 ENEMY（真实探测
+        // 敌人坐标，地图单位）。原 localization_get_pose 内硬编码上报
+        // （含假数据 ENEMY:300.0,400.0）已删除，统一并入本节流块：
+        // 共享数据（轮速/敌人坐标由 ISR 更新）在临界区中复制后再组包发送，
+        // 严禁在临界区内调用阻塞的 bt_send_line
+        ENCODER_SensorTypeDef wheels;
+        float enemy_x, enemy_y;
+        uint8_t has_enemy;
+        ENTER_CRITICAL();
+        wheels = robot->loc_module.wheel_speeds;
+        enemy_x = robot->enemy_x;
+        enemy_y = robot->enemy_y;
+        has_enemy = robot->has_enemy;
+        EXIT_CRITICAL();
+
+        snprintf(buf, sizeof(buf), "PID:0,%.3f,0.0", (double)wheels.lf_speed);
+        bt_send_line(buf);
+        snprintf(buf, sizeof(buf), "PID:1,%.3f,0.0", (double)wheels.rf_speed);
+        bt_send_line(buf);
+        snprintf(buf, sizeof(buf), "PID:2,%.3f,0.0", (double)wheels.lb_speed);
+        bt_send_line(buf);
+        snprintf(buf, sizeof(buf), "PID:3,%.3f,0.0", (double)wheels.rb_speed);
+        bt_send_line(buf);
+        if (has_enemy)
+        {
+            snprintf(buf, sizeof(buf), "ENEMY:%.1f,%.1f",
+                     (double)real_to_map(enemy_x), (double)real_to_map(enemy_y));
+            bt_send_line(buf);
+        }
+
         robot->last_pos_send_ms = now;
         robot->last_sent_x = pose->x;
         robot->last_sent_y = pose->y;
@@ -260,23 +296,28 @@ void robot_update(RobotController *robot)
 #endif
     }
 
-    // 处理雷达更新标志位
+    // 处理雷达更新标志位（临界区内只取值/清标志；log_print 为阻塞串口
+    // 输出，严禁在临界区内调用，打印统一放到 EXIT_CRITICAL 之后）
+    uint8_t lidar_flag;
     ENTER_CRITICAL();
-    uint8_t lidar_flag = robot->irq_flags.lidar_update_flag;
-#if DEBUG_PRINT
-    log_print("lidar_flag:%d\n", lidar_flag);
-#endif
+    lidar_flag = robot->irq_flags.lidar_update_flag;
     if (lidar_flag)
     {
         robot->irq_flags.lidar_update_flag = 0;
-#if DEBUG_PRINT
-        log_print("lidar_update_flag:%n\n", robot->irq_flags.lidar_update_flag);
-#endif
     }
     EXIT_CRITICAL();
+#if DEBUG_PRINT
+    // 打印的是清零前捕获到的局部变量；%n 为写内存的危险格式符，已改为 %d
+    log_print("lidar_flag:%d\n", lidar_flag);
+    if (lidar_flag)
+    {
+        log_print("lidar_update_flag:%d\n", lidar_flag);
+    }
+#endif
 
     if (lidar_flag)
     {
+#if DEBUG_PRINT
         if (robot->has_enemy)
         {
             float x = real_to_map(robot->enemy_x);
@@ -287,6 +328,7 @@ void robot_update(RobotController *robot)
         {
             log_print("enemy:(-1.0, -1.0)\n");
         }
+#endif
     }
 
     // 处理循迹数据标志位
@@ -352,7 +394,8 @@ void robot_update(RobotController *robot)
         log_print("FSM->current_idle\n");
 #endif
 
-        if (robot->has_enemy)
+        // 有对手或有目标（任一为真）即转入导航
+        if (robot->has_enemy || robot->has_target)
         {
 #if DEBUG_PRINT
             log_print("FSM->has_enemy\n");
@@ -461,8 +504,10 @@ void robot_update(RobotController *robot)
         robot->is_calibrated = 1;
         EXIT_CRITICAL();
 
+#if DEBUG_PRINT
         log_print("calibrated pos update(%.1f, %.1f)\n",
                   robot->loc_module.current_pose.x, robot->loc_module.current_pose.y);
+#endif
 
         // 校准状态保持停止，等待外部触发进入导航
         ENTER_CRITICAL();
@@ -515,7 +560,9 @@ void robot_set_target(RobotController *robot, float x, float y, NavigationMode m
     robot->state = ROBOT_NAVIGATING;
     EXIT_CRITICAL();
 
+#if DEBUG_PRINT
     log_print("FSM->set target: (%.2f, %.2f), mode: %d\r\n", x, y, mode);
+#endif
 }
 
 void robot_set_enemy(RobotController *robot, float x, float y)
@@ -529,7 +576,9 @@ void robot_set_enemy(RobotController *robot, float x, float y)
     robot->has_enemy = (x >= 0 && y >= 0);
     EXIT_CRITICAL();
 
+#if DEBUG_PRINT
     log_print("FSM->update enemy_pos: (%.2f, %.2f)\r\n", x, y);
+#endif
 }
 
 void robot_emergency_stop(RobotController *robot)
@@ -543,7 +592,9 @@ void robot_emergency_stop(RobotController *robot)
     robot->has_target = 0;
     EXIT_CRITICAL();
 
+#if DEBUG_PRINT
     log_print("FSM->emergency_stop\r\n");
+#endif
     execute_movement(DIRECTION_STOP, robot);
 }
 
@@ -582,13 +633,23 @@ void init(RobotController *robot)
         log_print("MPU6050 init success!\r\n");
     }
 
-    // n10_init();
+    // 雷达 UART 接收中断启动（恢复调用，否则 lidar_it 读不到数据）
+    n10_init();
 
-    encoder_setparam(13, 4, 6.5f);
-    // 编码器初始化
+    // 编码器初始化（encoder_init 内部已调用 encoder_setparam(13,4,6.5f)，
+    // 此处原先重复调用一次，属死重复，已删除）
     encoder_init();
+    // 电机 PWM 通道初始化（HAL_TIM_PWM_Start）：正常启动路径此前从未开启
+    // PWM，只在 test_motor() 里调过 motor_init()，属 P0 缺陷
+    motor_init();
 #if DEBUG_PRINT
-    log_print("%u,%u,%u,%u\n", encoder_readspeed(encoder_front_left), encoder_readspeed(encoder_back_left), encoder_readspeed(encoder_back_right), encoder_readspeed(encoder_front_right));
+    // encoder_readspeed 返回 float 且带“读取即清零计数器”副作用：
+    // 先各存入局部变量，再用 %f 打印（原 %u 为未定义行为）
+    float sp_fl = encoder_readspeed(encoder_front_left);
+    float sp_bl = encoder_readspeed(encoder_back_left);
+    float sp_br = encoder_readspeed(encoder_back_right);
+    float sp_fr = encoder_readspeed(encoder_front_right);
+    log_print("%f,%f,%f,%f\n", sp_fl, sp_bl, sp_br, sp_fr);
 #endif
     robot_init(robot, INIT_ID, INIT_X, INIT_Y, INIT_T, TARGET_X, TARGET_Y);
 }
@@ -677,7 +738,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 #if DEBUG_PRINT
         log_print("IT:10ms\n");
 #endif
-        // hd_it(&global_robot);
+        // 注：TIM7/TIM12 的启动在仓库外的 main/CubeMX 代码中；
+        // 若外部未启动这两个定时器，本调用自然不会触发
+        hd_it(&global_robot);
     }
 
     if (htim->Instance == TIM8)
@@ -689,10 +752,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     }
 
     if (htim->Instance == TIM12)
-    { // 判断是否为TIM7中断
+    { // 判断是否为TIM12中断
 #if DEBUG_PRINT
         log_print("50ms\n");
 #endif
-        // lidar_it(&global_robot);
+        // 注：TIM7/TIM12 的启动在仓库外的 main/CubeMX 代码中；
+        // 若外部未启动这两个定时器，本调用自然不会触发
+        lidar_it(&global_robot);
     }
 }

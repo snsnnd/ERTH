@@ -8,6 +8,9 @@
 int SCL_bit = 1;
 int SDA_bit = 1;
 
+// 忙等超时上限（防止从机拉死 SDA/SCL 导致死循环，超时后走总线恢复）
+#define SOFT_I2C_WAIT_TIMEOUT 10000U
+
 /*
  *函数：I2C写SCL电平
  *参数：BitValue 当前需要写入SCL的电平，值为0或1
@@ -55,13 +58,36 @@ uint8_t SOFT_I2C_R_SDA(void)
 }
 
 /*
+ *函数：带超时计数地等待 SDA 释放为高电平
+ *参数：无
+ *返回值：1=SDA 已释放；0=超时（SDA 仍被从机拉低）
+ *注意事项：忙等循环带上限计数，防止从机拉死 SDA 造成死循环
+ */
+static uint8_t soft_i2c_wait_sda_release(void)
+{
+    uint32_t timeout = SOFT_I2C_WAIT_TIMEOUT;
+    while (SOFT_I2C_R_SDA() == 0)
+    {
+        if (timeout-- == 0U)
+        {
+            return 0; // 超时：SDA 被从机拉死
+        }
+    }
+    return 1;
+}
+
+/*
  *函数：I2C开始信号
  *参数：无
  *返回值：无
- *注意事项：无
+ *注意事项：发送前先带超时等待 SDA 释放；若超时先执行总线恢复再发 START
  */
 void SOFT_I2C_Start(void)
 {
+    if (soft_i2c_wait_sda_release() == 0)
+    {
+        SOFT_I2C_BusRecover(); // SDA 被拉死：9 个时钟脉冲 + STOP 释放总线
+    }
     SOFT_I2C_W_SDA(1);
     SDA_bit = 1;
     SOFT_I2C_W_SCL(1);
@@ -86,6 +112,26 @@ void SOFT_I2C_Stop(void)
     SCL_bit = 1;
     SOFT_I2C_W_SDA(1);
     SDA_bit = 1;
+}
+
+/*
+ *函数：I2C总线恢复序列
+ *参数：无
+ *返回值：无
+ *说明：等待超时或通信失败（应答超时/失败，如从机把 SDA 拉死）时调用：
+ *      释放 SDA → 产生至多 9 个 SCL 时钟脉冲 → 发送 STOP。
+ *      从机可在时钟脉冲中发完剩余字节并释放 SDA，STOP 使总线回到空闲态。
+ */
+void SOFT_I2C_BusRecover(void)
+{
+    uint8_t i;
+    SOFT_I2C_W_SDA(1); // 释放 SDA
+    for (i = 0; i < 9; i++)
+    {
+        SOFT_I2C_W_SCL(1); // 至多 9 个时钟脉冲
+        SOFT_I2C_W_SCL(0);
+    }
+    SOFT_I2C_Stop(); // 发 STOP，总线回到空闲（SCL/SDA 均为高）
 }
 
 /*

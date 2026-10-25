@@ -106,10 +106,12 @@ uint8_t n10_process_frame(N10_PointCloud_FrameTypeDef *frame)
 #if DEBUG_PRINT
         printf("Frame header error! Drop 1 byte:0x%02X\r\n", frame_buf[0]);
 #endif
-        // 回写剩余数据
+        // 回写剩余数据（主循环上下文：count 读-改-写需临界区，防中断插入丢失更新）
         for (uint16_t i = 1; i < N10_FRAME_LEN; i++)
         {
+            __disable_irq();
             n10_ringbuf_write(&n10_ring_buf, frame_buf[i]);
+            __enable_irq();
         }
         return 0;
     }
@@ -276,6 +278,11 @@ static void n10_ringbuf_init(RingBufferTypeDef *rb)
     memset(rb->buf, 0, RING_BUF_SIZE);
 }
 
+/**
+ * @brief  写入环形缓冲区
+ * @note   中断上下文（n10_rx_byte）调用时天然原子，不进临界区；
+ *         主循环上下文（帧头错误回写）调用时由调用点包临界区，与中断侧的 count 更新互斥
+ */
 static uint8_t n10_ringbuf_write(RingBufferTypeDef *rb, uint8_t data)
 {
     if (rb->count >= RING_BUF_SIZE)
@@ -287,25 +294,37 @@ static uint8_t n10_ringbuf_write(RingBufferTypeDef *rb, uint8_t data)
 }
 
 /**
- * @brief  读取环形缓冲区
+ * @brief  读取环形缓冲区（仅主循环上下文调用）
+ * @note   count/tail 与中断写入端共享，读-改-写在临界区内完成，防止中断插入导致 count 更新丢失
  */
 static uint8_t n10_ringbuf_read(RingBufferTypeDef *rb, uint8_t *data)
 {
-    if (rb->count == 0)
-        return 0;
+    uint8_t ok = 0;
 
-    *data = rb->buf[rb->tail];
-    rb->tail = (rb->tail + 1) % RING_BUF_SIZE;
-    rb->count--;
-    return 1;
+    __disable_irq(); // 主循环侧临界区（中断侧 n10_rx_byte 天然原子，不进临界区）
+    if (rb->count != 0)
+    {
+        *data = rb->buf[rb->tail];
+        rb->tail = (rb->tail + 1) % RING_BUF_SIZE;
+        rb->count--;
+        ok = 1;
+    }
+    __enable_irq();
+    return ok;
 }
 
 /**
  * @brief  获取缓冲区数据长度
+ * @note   count 由中断与主循环共享，主循环侧在临界区内做一致性快照
  */
 static uint16_t n10_ringbuf_get_count(RingBufferTypeDef *rb)
 {
-    return rb->count;
+    uint16_t count;
+
+    __disable_irq();
+    count = rb->count;
+    __enable_irq();
+    return count;
 }
 
 // CRC计算、转速/角度解析函数（保持不变）

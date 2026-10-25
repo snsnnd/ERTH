@@ -57,8 +57,7 @@
 #define PIin(n) BIT_ADDR(GPIOI_IDR_Addr, n)  // ����
 
 // ����Ϊ��ຯ��
-void WFI_SET(void);          // ִ��WFIָ��
-void INTX_DISABLE(void);     // �ر������ж�
-void INTX_ENABLE(void);      // ���������ж�
-void MSR_MSP(uint32_t addr); // ���ö�ջ��ַ
+// 原 WFI_SET/INTX_DISABLE/INTX_ENABLE/MSR_MSP(sys.c) 为 ARMCC 专用 __asm
+// 内联汇编，全工程零调用，属死代码：sys.c 已删除、原型一并移除
+// （保留上方位带宏：oled.h 使用 PDout/PDin）
 #endif

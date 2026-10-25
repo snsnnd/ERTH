@@ -3,6 +3,10 @@
 #include "iic_mpu6050.h" // 新增：包含软件I2C头文件，调用软件I2C函数
 #include "BT.h"
 
+#define PI_F32 3.14159265358979323846f
+// 全工程陀螺仪物理单位契约：统一为 rad/s（°/s → rad/s 换算系数）
+#define DEG2RAD (PI_F32 / 180.0f)
+
 /**
  * @brief  软件I2C实现：写MPU6050单个寄存器
  * @param  RegAddress：目标寄存器地址
@@ -21,7 +25,7 @@ void MPU6050_WriteReg(uint8_t RegAddress, uint8_t Data)
     ack_flag = SOFT_I2C_ReceiveAck();   // 接收从机应答
     if (ack_flag != 0)                  // 无应答 → 通信失败
     {
-        SOFT_I2C_Stop(); // 发送停止信号，避免总线挂死
+        SOFT_I2C_BusRecover(); // 应答失败：总线恢复（至多9个时钟脉冲 + STOP），避免总线挂死
         return;
     }
 
@@ -30,7 +34,7 @@ void MPU6050_WriteReg(uint8_t RegAddress, uint8_t Data)
     ack_flag = SOFT_I2C_ReceiveAck();
     if (ack_flag != 0)
     {
-        SOFT_I2C_Stop();
+        SOFT_I2C_BusRecover(); // 应答失败（超时/失败）：总线恢复（至多9个时钟脉冲 + STOP）
 
         return;
     }
@@ -40,7 +44,7 @@ void MPU6050_WriteReg(uint8_t RegAddress, uint8_t Data)
     ack_flag = SOFT_I2C_ReceiveAck();
     if (ack_flag != 0)
     {
-        SOFT_I2C_Stop();
+        SOFT_I2C_BusRecover(); // 应答失败（超时/失败）：总线恢复（至多9个时钟脉冲 + STOP）
 
         return;
     }
@@ -68,7 +72,7 @@ void MPU6050_ReadRegs(uint8_t RegAddress, uint8_t *pData, uint16_t Size)
     ack_flag = SOFT_I2C_ReceiveAck();
     if (ack_flag != 0)
     {
-        SOFT_I2C_Stop();
+        SOFT_I2C_BusRecover(); // 应答失败（超时/失败）：总线恢复（至多9个时钟脉冲 + STOP）
 
         return;
     }
@@ -78,7 +82,7 @@ void MPU6050_ReadRegs(uint8_t RegAddress, uint8_t *pData, uint16_t Size)
     ack_flag = SOFT_I2C_ReceiveAck();
     if (ack_flag != 0)
     {
-        SOFT_I2C_Stop();
+        SOFT_I2C_BusRecover(); // 应答失败（超时/失败）：总线恢复（至多9个时钟脉冲 + STOP）
 
         return;
     }
@@ -90,7 +94,7 @@ void MPU6050_ReadRegs(uint8_t RegAddress, uint8_t *pData, uint16_t Size)
     ack_flag = SOFT_I2C_ReceiveAck();
     if (ack_flag != 0)
     {
-        SOFT_I2C_Stop();
+        SOFT_I2C_BusRecover(); // 应答失败（超时/失败）：总线恢复（至多9个时钟脉冲 + STOP）
 
         return;
     }
@@ -252,9 +256,11 @@ float mpu6050_acc_transition(int16_t acc_value)
 }
 
 /**
- * @brief  陀螺仪原始数据→物理单位（°/s）转换
+ * @brief  陀螺仪原始数据→物理单位（rad/s）转换
  * @param  gyro_value：陀螺仪原始16位数据
- * @retval 转换后的物理值（单位：°/s，度/秒）
+ * @retval 转换后的物理值（单位：rad/s，弧度/秒）
+ * @note   全工程陀螺仪单位契约为 rad/s：先按量程换算为 °/s，再统一乘 π/180 转为 rad/s。
+ *         调用方（top/sensor.c 等）直接透传本返回值即可得到 rad/s，禁止再次乘 π/180。
  */
 float mpu6050_gyro_transition(int16_t gyro_value)
 {
@@ -278,10 +284,9 @@ float mpu6050_gyro_transition(int16_t gyro_value)
         gyro_data = 0;
         break;
     }
-    return gyro_data;
+    // °/s → rad/s：全工程统一单位为 rad/s
+    return gyro_data * DEG2RAD;
 }
-
-#define PI_F32 3.14159265358979323846f
 
 void mpu6050_calibrate_gyro(float *gyro_offset, uint16_t sample_count)
 {
@@ -300,10 +305,10 @@ void mpu6050_calibrate_gyro(float *gyro_offset, uint16_t sample_count)
         // 读取原始陀螺仪数据
         mpu6050_get_gyro(&raw_gx, &raw_gy, &raw_gz);
 
-        // 转换为物理单位（°/s），再转为rad/s（滤波器使用弧度单位）
-        float gx = mpu6050_gyro_transition(raw_gx) * PI_F32 / 180.0f;
-        float gy = mpu6050_gyro_transition(raw_gy) * PI_F32 / 180.0f;
-        float gz = mpu6050_gyro_transition(raw_gz) * PI_F32 / 180.0f;
+        // mpu6050_gyro_transition 已返回 rad/s（全工程单位契约），直接累加，不可再乘 π/180
+        float gx = mpu6050_gyro_transition(raw_gx);
+        float gy = mpu6050_gyro_transition(raw_gy);
+        float gz = mpu6050_gyro_transition(raw_gz);
 
         // 累加数据
         sum_gx += gx;
@@ -345,7 +350,7 @@ void test_mpu6050()
         mpu6050_get_acc(&acc_x, &acc_y, &acc_z);
         mpu6050_get_gyro(&gyro_x, &gyro_y, &gyro_z);
 
-        // 转换为物理单位
+        // 转换为物理单位（加速度：g；陀螺仪：rad/s，全工程单位契约）
         float ax = mpu6050_acc_transition(acc_x);
         float ay = mpu6050_acc_transition(acc_y);
         float az = mpu6050_acc_transition(acc_z);

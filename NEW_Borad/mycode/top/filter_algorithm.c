@@ -144,8 +144,7 @@ float KalmanFilter_Update(KalmanFilter *kf, float new_angle, float new_gyro, flo
     // 预测步骤
     kf->angle += dt * (new_gyro - kf->bias);
 
-    // 协方差预测
-    float dt2 = dt * dt;
+    // 协方差预测（标准 angle-bias 卡尔曼形式；原 dt2 = dt*dt 为死变量已删）
     kf->P[0][0] += dt * (dt * kf->P[1][1] - kf->P[0][1] - kf->P[1][0] + kf->Q_angle);
     kf->P[0][1] -= dt * kf->P[1][1];
     kf->P[1][0] = kf->P[0][1];

@@ -104,6 +104,8 @@ uint8_t sensor_hd_read_digital(Track_SensorTypeDef *track)
     }
 
     track->sensor = HD_Serial_Read();
+    // 协议遥测（非调试日志）：上位机 final.py 按 "track_data:" 前缀解析，
+    // 属对战/调试平台协议字段，故意不受 DEBUG_PRINT 控制
     log_print("track_data:%hu\n", track->sensor);
     return 1; // 读取成功
 }

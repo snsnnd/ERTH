@@ -136,10 +136,10 @@ class CarLink:
     """单车 SPP 串口链路封装（对战协议 v1）
 
     - bytes 级缓冲按 \\n 切分后再逐行解码，避免粘包时劈坏多字节字符
-    - 接收缓冲上限 8KB 防溢出
+    - 接收缓冲上限 64KB 防溢出，超限丢弃最旧数据并告警一次
     - per-car 状态：pos / rpos / 最后收时间 / 最后 POS 时间（3 秒离线判定）
     """
-    BUFFER_LIMIT = 8 * 1024   # 接收缓冲上限（字节）
+    BUFFER_LIMIT = 64 * 1024  # 接收缓冲上限（字节，64KB）
     OFFLINE_TIMEOUT = 3.0     # 秒：未收到 POS 判离线
 
     def __init__(self, tag, on_line=None, encoding='utf-8'):
@@ -150,6 +150,7 @@ class CarLink:
         self.encoding = encoding
         self.on_line = on_line             # callback(tag, line)
         self.rx_buffer = b''               # bytes 级粘包缓冲
+        self._buffer_overflow_warned = False  # 缓冲超限告警只发一次
         # per-car 状态
         self.pos = None                    # (x, y) 实际位置
         self.rpos = None                   # (x, y) 上报位置
@@ -171,6 +172,7 @@ class CarLink:
         self.baudrate = int(baudrate)
         self.serial_obj = serial.Serial(port, self.baudrate, timeout=1)
         self.rx_buffer = b''
+        self._buffer_overflow_warned = False  # 新连接允许再告警一次
         self.timer.start(10)  # 每 10ms 读取一次
         return True
 
@@ -197,8 +199,12 @@ class CarLink:
             return []
         self.rx_buffer += data
         if len(self.rx_buffer) > self.BUFFER_LIMIT:
-            # 防溢出：只保留缓冲区尾部
+            # 防溢出：丢弃最旧数据，只保留缓冲区尾部；告警一次避免刷屏
             self.rx_buffer = self.rx_buffer[-self.BUFFER_LIMIT:]
+            if not self._buffer_overflow_warned:
+                self._buffer_overflow_warned = True
+                print(f"[{self.tag}] 接收缓冲超过 {self.BUFFER_LIMIT // 1024}KB 上限，"
+                      f"已丢弃最旧数据")
         lines = []
         while b'\n' in self.rx_buffer:
             raw, self.rx_buffer = self.rx_buffer.split(b'\n', 1)
@@ -214,14 +220,21 @@ class CarLink:
             return
         try:
             bytes_to_read = min(self.serial_obj.in_waiting, 1024)
-            if bytes_to_read > 0:
-                data = self.serial_obj.read(bytes_to_read)
-                for line in self.feed_bytes(data):
-                    self.last_rx_time = time.time()
-                    if self.on_line:
-                        self.on_line(self.tag, line)
+            if bytes_to_read <= 0:
+                return
+            data = self.serial_obj.read(bytes_to_read)
         except Exception as e:
             print(f"[{self.tag}] 串口读取错误: {e}")
+            return
+        # 逐行隔离：单行处理异常只记日志，不中断本批次其余行
+        for line in self.feed_bytes(data):
+            self.last_rx_time = time.time()
+            if not self.on_line:
+                continue
+            try:
+                self.on_line(self.tag, line)
+            except Exception as e:
+                print(f"[{self.tag}] 行处理错误: {e}")
 
     # ---------- 发送 ----------
     def send_line(self, text):
@@ -598,8 +611,9 @@ class MapWidget(QWidget):
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
                 content = file.read()
 
-            # 改进的节点解析正则表达式
-            node_pattern = r'\{(\d+),\s*([\d.]+)f?,\s*([\d.]+)f?,\s*(\d+),\s*([\d.]+)f?,\s*([\d.]+)f?,\s*(\d+),\s*\{([^}]+)\}\}'
+            # 改进的节点解析正则表达式：坐标/费用支持负数（-30.0f 等负坐标不再漏解析）
+            node_pattern = (r'\{(-?\d+),\s*(-?[\d.]+)f?,\s*(-?[\d.]+)f?,\s*(-?\d+),'
+                            r'\s*(-?[\d.]+)f?,\s*(-?[\d.]+)f?,\s*(-?\d+),\s*\{([^}]+)\}\}')
             node_matches = re.findall(node_pattern, content)
 
             self.nodes = []
@@ -632,9 +646,18 @@ class MapWidget(QWidget):
                     'neighbors': neighbors
                 })
 
-            # 改进的边解析正则表达式
-            edge_pattern = r'\{(\d+),\s*(\d+),\s*([\d.]+)f?,\s*([\d.]+)f?\}'
-            edge_matches = re.findall(edge_pattern, content)
+            # 边解析：只在 .edges = ... node_count 区域内匹配——否则四邻居槽
+            # {10,12,3,22}（全为整数）会被误判成 4 条伪边；端点与距离允许负号。
+            # 无区域标记时退化为要求浮点字面量带小数点，同样排除邻居槽
+            edge_start = content.find('.edges =')
+            edge_end = content.find('node_count')
+            if 0 <= edge_start < edge_end:
+                edge_region = content[edge_start:edge_end]
+                edge_pattern = r'\{(-?\d+),\s*(-?\d+),\s*(-?[\d.]+)f?,\s*(-?[\d.]+)f?\}'
+            else:
+                edge_region = content
+                edge_pattern = r'\{(-?\d+),\s*(-?\d+),\s*(-?\d+\.\d*f?),\s*(-?\d+\.\d*f?)\}'
+            edge_matches = re.findall(edge_pattern, edge_region)
 
             self.edges = []
             for match in edge_matches:
@@ -724,7 +747,7 @@ class PIDWidget(QWidget):
         self.max_points = 100  # 显示的最大数据点数
         self.yaw_data = []  # 偏航角数据
         self.yaw_curve = None  # 偏航角曲线
-        self.target_pid_data = []  # PID目标值数据（单一列表）
+        self.target_pid_data = {i: [] for i in range(4)}  # 每个电机各自的目标值数据
         self.target_yaw_data = []  # 偏航角目标值数据
         self.target_pid_curves = {}  # PID目标值曲线
         self.target_yaw_curve = None  # 偏航角目标值曲线
@@ -817,8 +840,12 @@ class PIDWidget(QWidget):
             if i != motor_id:
                 self.motor_data[i]['data'].append(0)  # 或使用上一个值
 
-        # 添加目标值（为所有电机维护统一的目标值列表）
-        self.target_pid_data.append(target_pid_value)
+        # 每个电机维护各自的目标值；其他电机保持上次目标值以对齐时间轴
+        self.target_pid_data[motor_id].append(target_pid_value)
+        for i in range(4):
+            if i != motor_id:
+                last_target = self.target_pid_data[i][-1] if self.target_pid_data[i] else 0
+                self.target_pid_data[i].append(last_target)
 
         # 为其他数据添加占位符以保持时间轴一致
         self.yaw_data.append(0)
@@ -831,9 +858,10 @@ class PIDWidget(QWidget):
             for i in range(4):
                 if self.motor_data[i]['data']:
                     self.motor_data[i]['data'].pop(0)
-            # 同时移除目标PID数据和偏航角数据
-            if self.target_pid_data:
-                self.target_pid_data.pop(0)
+                # 同时移除该电机的目标值数据，保持时间轴对齐
+                if self.target_pid_data[i]:
+                    self.target_pid_data[i].pop(0)
+            # 同时移除偏航角数据
             if self.yaw_data:
                 self.yaw_data.pop(0)
             if self.target_yaw_data:
@@ -850,21 +878,15 @@ class PIDWidget(QWidget):
                     # 动态调整X轴范围
                     if len(x_data) > 0:
                         self.plot_widgets[i].setXRange(max(0, x_data[-1] - self.max_points), x_data[-1])
+                    # 该电机自己的目标值比对线（红色虚线）
+                    target_len = min(len(self.time_data), len(self.target_pid_data[i]))
+                    if target_len > 0:
+                        self.target_pid_curves[i].setData(self.time_data[-target_len:],
+                                                          self.target_pid_data[i][-target_len:])
                     if i == motor_id:
                         print(f"更新图表: 电机{i}, PID值{pid_value}, 数据点数{min_length}")
                 except Exception as e:
                     print(f"更新图表失败: {e}")
-
-        # 更新目标PID值比对线
-        if len(self.target_pid_data) > 0:
-            min_length = min(len(self.time_data), len(self.target_pid_data))
-            if min_length > 0:
-                x_data = self.time_data[-min_length:]
-                y_data = self.target_pid_data[-min_length:]
-                self.target_pid_curves[motor_id].setData(x_data, y_data)
-                # 动态调整X轴范围
-                if len(x_data) > 0:
-                    self.plot_widgets[motor_id].setXRange(max(0, x_data[-1] - self.max_points), x_data[-1])
 
     # 修改 PIDWidget 类的 update_yaw_data 方法
     def update_yaw_data(self, yaw_value, target_yaw_value=0):
@@ -1366,7 +1388,11 @@ class BluetoothDebugTool(QMainWindow):
         self.process_line(tag, line)
 
     def process_line(self, src, line):
-        """按对战协议 v1 解析某车上报的一行数据（src: 'A'/'B'），双车数据互不串仓"""
+        """按对战协议 v1 解析某车上报的一行数据（src: 'A'/'B'），双车数据互不串仓。
+
+        先 startswith 校验前缀，再按 len(前缀) 切片；每个消息 handler 独立
+        try/except，异常只记日志，不影响其他消息与读取循环。
+        """
         try:
             line = line.strip()
             if not line:
@@ -1377,60 +1403,74 @@ class BluetoothDebugTool(QMainWindow):
 
             if line.startswith("PID:"):
                 # 解析PID数据 (格式: PID:电机ID,实际值,目标值)
-                pid_parts = line[4:].split(",")
-                if len(pid_parts) >= 2:
-                    motor_id = int(pid_parts[0])
-                    pid_value = float(pid_parts[1])
-                    target_pid_value = 0  # 默认目标值为0
-                    if len(pid_parts) >= 3:
-                        target_pid_value = float(pid_parts[2])
-                    self.pid_widgets[src].update_pid_data(motor_id, pid_value, target_pid_value)
+                try:
+                    pid_parts = line[len("PID:"):].split(",")
+                    if len(pid_parts) >= 2:
+                        motor_id = int(pid_parts[0])
+                        pid_value = float(pid_parts[1])
+                        target_pid_value = 0  # 默认目标值为0
+                        if len(pid_parts) >= 3:
+                            target_pid_value = float(pid_parts[2])
+                        self.pid_widgets[src].update_pid_data(motor_id, pid_value, target_pid_value)
+                except Exception as e:
+                    print(f"[{src}] PID 消息处理错误: {e}")
 
             elif line.startswith("RPOS:"):
                 # RPOS:上报位置（谎报），经裁判校验后决定转发或拒收
-                rpos_parts = line[5:].split(",")
-                if len(rpos_parts) >= 2:
-                    x_str = rpos_parts[0].strip()
-                    y_str = rpos_parts[1].strip()
-                    self._handle_rpos(src, x_str, y_str)
+                try:
+                    rpos_parts = line[len("RPOS:"):].split(",")
+                    if len(rpos_parts) >= 2:
+                        x_str = rpos_parts[0].strip()
+                        y_str = rpos_parts[1].strip()
+                        self._handle_rpos(src, x_str, y_str)
+                except Exception as e:
+                    print(f"[{src}] RPOS 消息处理错误: {e}")
 
             elif line.startswith("POS:"):
                 # POS:实际位置（仅用于裁判校验与真实位置显示，绝不转发给对手）
-                pos_parts = line[4:].split(",")
-                if len(pos_parts) >= 2:
-                    x = float(pos_parts[0])
-                    y = float(pos_parts[1])
-                    link.pos = (x, y)
-                    link.note_pos()
-                    self.map_widget.update_car_position(src, x, y)
+                try:
+                    pos_parts = line[len("POS:"):].split(",")
+                    if len(pos_parts) >= 2:
+                        x = float(pos_parts[0])
+                        y = float(pos_parts[1])
+                        link.pos = (x, y)
+                        link.note_pos()
+                        self.map_widget.update_car_position(src, x, y)
+                except Exception as e:
+                    print(f"[{src}] POS 消息处理错误: {e}")
 
             elif line.startswith("ENEMY:"):
-                # 旧协议字段：修正 off-by-one（应为 line[6:]），仅记录不接入对战通道
-                enemy_parts = line[6:].split(",")
-                if len(enemy_parts) >= 2:
-                    x = float(enemy_parts[0])
-                    y = float(enemy_parts[1])
-                    self.append_log(src, f"[解析] ENEMY {x},{y}（旧协议字段，未接入对战通道）",
-                                    LOG_COLOR_GREY)
+                # 旧协议字段：前缀校验后按前缀长度切片，仅记录不接入对战通道
+                try:
+                    enemy_parts = line[len("ENEMY:"):].split(",")
+                    if len(enemy_parts) >= 2:
+                        x = float(enemy_parts[0])
+                        y = float(enemy_parts[1])
+                        self.append_log(src, f"[解析] ENEMY {x},{y}（旧协议字段，未接入对战通道）",
+                                        LOG_COLOR_GREY)
+                except Exception as e:
+                    print(f"[{src}] ENEMY 消息处理错误: {e}")
 
             elif line.startswith("YAW:"):
                 # 解析偏航角数据 (格式: YAW:实际值,目标值)
-                yaw_parts = line[4:].split(",")
-                yaw_value = yaw_parts[0]
-                target_yaw_value = 0  # 默认目标值为0
-                if len(yaw_parts) >= 2:
-                    target_yaw_value = yaw_parts[1]
                 try:
+                    yaw_parts = line[len("YAW:"):].split(",")
+                    yaw_value = yaw_parts[0]
+                    target_yaw_value = 0  # 默认目标值为0
+                    if len(yaw_parts) >= 2:
+                        target_yaw_value = yaw_parts[1]
                     yaw_value = float(yaw_value)
                     target_yaw_value = float(target_yaw_value)
                     self.pid_widgets[src].update_yaw_data(yaw_value, target_yaw_value)
                 except ValueError:
-                    print(f"无效的偏航角数据: {yaw_value}")
+                    print(f"无效的偏航角数据: {yaw_parts[0] if yaw_parts else line}")
+                except Exception as e:
+                    print(f"[{src}] YAW 消息处理错误: {e}")
 
             elif line.startswith("track_data:"):
                 try:
-                    # 提取track_data后面的数值
-                    value = int(line[11:])
+                    # 提取 track_data 前缀后的数值（前缀校验后按前缀长度切片）
+                    value = int(line[len("track_data:"):])
                     # 转换为16位二进制字符串，然后只取后8位
                     binary_str = format(value, '016b')
                     last_8_bits = binary_str[8:]
@@ -1438,6 +1478,8 @@ class BluetoothDebugTool(QMainWindow):
                     self.append_log(src, f"[解析] track_data: {value} => 后8位二进制: {formatted_binary}")
                 except ValueError:
                     self.append_log(src, f"[错误] 无法解析track_data: {line}", LOG_COLOR_WARN)
+                except Exception as e:
+                    print(f"[{src}] track_data 消息处理错误: {e}")
 
         except Exception as e:
             print(f"解析数据错误: {e}")

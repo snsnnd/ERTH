@@ -13,7 +13,8 @@
 #define IN_3_2 TIM1->CCR2
 #define IN_4_2 TIM1->CCR4
 
-static int16_t abs(int16_t num)
+// 原 static int16_t abs(...)：与 C 内建/stdlib 的 abs 冲突（gcc -Wbuiltin-declaration-mismatch），改名 iabs
+static int16_t iabs(int16_t num)
 {
     return (num < 0) ? -num : num;
 }
@@ -84,7 +85,7 @@ void motor_setspeed(enum MOTOR motor, int16_t pwm)
     else
     {
         // log_print("-\t");
-        pwm = abs(pwm);
+        pwm = iabs(pwm);
         if (pwm > PWM_MAX)
         {
             pwm = PWM_MAX;
@@ -123,7 +124,7 @@ void test_motor()
     OLED_ShowString(0, 0, (u8 *)"Number Test:"); // 提示文字（第1行）
     uint32_t count = TIM9->CCR1;
     OLED_ShowNumber(0, 20, count, 5, 16);
-    uint32_t in = IN_2_1;
-    OLED_ShowNumber(0, 40, count, 5, 16);
+    uint32_t in = IN_2_1; // 原笔误：此处重复显示 count，导致 in 算而未用
+    OLED_ShowNumber(0, 40, in, 5, 16); // 修正：显示 in（死变量由此变为有用）
     OLED_Refresh_Gram(); // 刷新显示
 }

@@ -14,10 +14,9 @@
 // void led_init(void);
 // void led_on(void);
 // void led_off(void);
-void led_yellow(uint8_t a);
-void led_red(uint8_t a);
-void led_blue(uint8_t a);
-void led_green(uint8_t a);
+
+// 说明：原 led_yellow/led_red/led_blue/led_green 四个函数依赖空宏（宏体为空导致
+// 调用无效且无法编译），且全工程零调用者，已连同空宏与调用点一并删除（详见 led.c 注释）。
 
 // void test_led(void);
 

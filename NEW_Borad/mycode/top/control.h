@@ -18,7 +18,7 @@ typedef enum
 /**
  * @brief 将地图方向转换为机器人动作
  * @param map_dir  目标地图方向（MAP_DIR_xxx）
- * @param current_pose 机器人当前姿态（包含当前角度theta）
+ * @param current_pose 机器人当前朝向角度指针（theta，单位：弧度）
  * @return 机器人需要执行的动作（RobotAction）
  */
 int map_dir_to_robot_action(Direction map_dir, float *current_pose);
@@ -31,8 +31,6 @@ void print_robot_action(RobotAction action);
 
 void forward(void);
 
-void left(void);
-void right(void);
 void turn_left(int16_t speed);
 void turn_right(int16_t speed);
 void turn_back(int16_t speed);

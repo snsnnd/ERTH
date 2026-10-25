@@ -10,10 +10,10 @@
  */
 typedef struct
 {
-    uint8_t buf[256]; // 缓冲区数组
-    uint16_t head;    // 写入索引
-    uint16_t tail;    // 读取索引
-    uint16_t count;   // 有效数据长度
+    uint8_t buf[256];         // 缓冲区数组
+    volatile uint16_t head;   // 写入索引（中断写、主循环读，必须 volatile）
+    volatile uint16_t tail;   // 读取索引（主循环写、中断读，必须 volatile）
+    volatile uint16_t count;  // 有效数据长度（中断/主循环两端读-改-写，必须 volatile + 临界区）
 } RingBufferTypeDef;
 
 /**
