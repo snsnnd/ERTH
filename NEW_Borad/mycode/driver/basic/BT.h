@@ -1,7 +1,7 @@
 #ifndef BT_H
 #define BT_H
 
-#include "stm32f4xx_hal.h"
+#include "stm32f1xx_hal.h" // 实际 MCU：STM32F103C8T6
 #include <stdarg.h>
 #include <inttypes.h> // 定义 PRIu16 宏
 

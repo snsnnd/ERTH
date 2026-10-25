@@ -1,7 +1,7 @@
 #ifndef __TIME_H
 #define __TIME_H
 
-#include "stm32f4xx_hal.h"
+#include "stm32f1xx_hal.h" // 实际 MCU：STM32F103C8T6
 
 /**
  * @brief  获取系统启动到当前的毫秒数

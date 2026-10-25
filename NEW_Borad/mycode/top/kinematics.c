@@ -1,5 +1,4 @@
 #include "kinematics.h"
-#include "arm_math.h"
 #include <stdint.h>
 #include <math.h> // isnan：C99 中为 math.h 宏，缺失会退化为隐式函数声明（链接隐患）
 #include "delay.h"
@@ -104,10 +103,8 @@ void kinematics_robot_to_global(float robot_dx, float robot_dy, float theta,
 #endif
         return;
     }
-    float cos_theta = arm_cos_f32(theta);
-    float sin_theta = arm_sin_f32(theta);
-    *global_dx = robot_dx * cos_theta - robot_dy * sin_theta;
-    *global_dy = robot_dx * sin_theta + robot_dy * cos_theta;
+    *global_dx = robot_dx * cosf(theta) - robot_dy * sinf(theta);
+    *global_dy = robot_dx * sinf(theta) + robot_dy * cosf(theta);
 }
 
 void kinematics_global_to_robot(float global_dx, float global_dy, float theta,
@@ -129,8 +126,6 @@ void kinematics_global_to_robot(float global_dx, float global_dy, float theta,
 #endif
         return;
     }
-    float cos_theta = arm_cos_f32(theta);
-    float sin_theta = arm_sin_f32(theta);
-    *robot_dx = global_dx * cos_theta + global_dy * sin_theta;
-    *robot_dy = global_dy * cos_theta - global_dx * sin_theta;
+    *robot_dx = global_dx * cosf(theta) + global_dy * sinf(theta);
+    *robot_dy = global_dy * cosf(theta) - global_dx * sinf(theta);
 }

@@ -2,8 +2,7 @@
 #define NA_H
 
 #include "map.h"
-#include "arm_math.h" // CMSIS-DSP for optimized math
-#include "utils.h"    // 用于距离计算等工具
+#include "utils.h" // 用于距离计算等工具（arm_math.h 已删：F1 工程无 CMSIS-DSP）
 
 // 最大节点数（与map.h一致）
 #define MAX_NODES 100

@@ -1,5 +1,5 @@
 #include "FSM.h"
-#include "arm_math.h"
+// arm_math.h 已删：STM32F103C8T6（Cortex-M3，无 FPU）工程不带 CMSIS-DSP，改用 math.h 的 sqrtf
 // Lidra.h（雷达点云聚类）已随雷达模块删除：敌人坐标改由对战平台 ORP 下发
 #include "control.h"
 #include <math.h>
@@ -436,7 +436,7 @@ void robot_update(RobotController *robot)
             dy = robot->target_y - current_pose.y;
             EXIT_CRITICAL();
 
-            arm_sqrt_f32(dx * dx + dy * dy, &dist);
+            dist = sqrtf(dx * dx + dy * dy);
             dist = map_to_real(dist);
 
             if (dist < 0.01f)
@@ -616,6 +616,9 @@ void init(RobotController *robot)
     // 电机 PWM 通道初始化（HAL_TIM_PWM_Start）：正常启动路径此前从未开启
     // PWM，只在 test_motor() 里调过 motor_init()，属 P0 缺陷
     motor_init();
+    // TIM1 基准（10ms）启动：hd_it/position_it 的周期回调挂在 TIM1 上
+    // （原方案 TIM7/TIM8 在 F103C8 上不存在，已合并为 TIM1 + 二分频）
+    HAL_TIM_Base_Start_IT(&htim1);
 #if DEBUG_PRINT
     // encoder_readspeed 返回 float 且带“读取即清零计数器”副作用：
     // 先各存入局部变量，再用 %f 打印（原 %u 为未定义行为）
@@ -682,23 +685,28 @@ void position_it(RobotController *robot)
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-    if (htim->Instance == TIM7)
-    { // 判断是否为TIM7中断
+    // 实际硬件（STM32F103C8T6）只有 TIM1~TIM4：TIM2/TIM4 编码器、TIM3 PWM，
+    // 故周期任务统一挂 TIM1（10ms），20ms 定位节拍由 10ms 基准二分频得到
+    // （原方案 TIM7=循迹 10ms / TIM8=定位 20ms 在 F103C8 上不存在）
+    if (htim->Instance == TIM1)
+    {
+        static uint8_t s_tim1_tick; // 10ms 计数，二分频出 20ms
+
 #if DEBUG_PRINT
         log_print("IT:10ms\n");
 #endif
-        // 注：TIM7/TIM12 的启动在仓库外的 main/CubeMX 代码中；
-        // 若外部未启动这两个定时器，本调用自然不会触发
+        // 注：TIM1 的启动在 init() 内 HAL_TIM_Base_Start_IT 完成；
+        // 若外部未启动该定时器，本调用自然不会触发
         hd_it(&global_robot);
-    }
 
-    if (htim->Instance == TIM8)
-    {
+        if (++s_tim1_tick >= 2)
+        {
+            s_tim1_tick = 0;
 #if DEBUG_PRINT
-        log_print("IT:20ms\n");
+            log_print("IT:20ms\n");
 #endif
-        position_it(&global_robot);
+            position_it(&global_robot);
+        }
     }
-
     // TIM12（原 50ms 雷达中断）分支已删除：雷达模块舍弃后不再需要
 }

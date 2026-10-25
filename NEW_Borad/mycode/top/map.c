@@ -15,8 +15,10 @@
 // 完整的全表 -1 初始化在 map_globalmap_init_id_map() 中用 memset 完成
 int16_t g_node_id_to_idx[MAX_NODE_ID] = {-1}; // 仅 [0]=-1；全表 -1 见上方说明（memset）
 bool g_node_map_inited = false;               // 初始化为未初始化
-// 新增：边代价索引表（假设节点ID范围不超过MAX_NODE_ID）
-float g_edge_cost_map[MAX_NODE_ID][MAX_NODE_ID];
+// 新增：边索引表就绪标志
+// 注：原 float g_edge_cost_map[MAX_NODE_ID][MAX_NODE_ID]（100×100×4B = 40KB）已删除：
+// STM32F103C8T6 仅 20KB SRAM，一张稠密浮点邻接矩阵直接超限。
+// 代价查询改为 map_edge_cost() 在 global_map.edges（≤400 条）上按需检索。
 bool g_edge_map_inited = false; // 边索引表是否初始化
 
 /***************************  全局地图初始化  ********************************/
@@ -239,7 +241,9 @@ void map_mark_danger_zone(Map *map, uint8_t enemy_node_id)
 
 bool map_validate(const Map *map)
 {
-    if (map == NULL || map->node_count == 0 || map->node_count > 100 || map->edge_count > 400)
+    // 注：原条件里的 `edge_count > 400` 是恒假比较（edge_count 为 uint8_t，最大 255），
+    // gcc -Wtype-limits 会报 "comparison is always false"，已删除
+    if (map == NULL || map->node_count == 0 || map->node_count > 100)
     {
 #if DEBUG_PRINT
         log_print("map->Invalid map: Empty or the number of nodes/edges exceeds the limit \r\n");
@@ -347,7 +351,7 @@ void map_globalmap_init_id_map(Map *map)
     g_node_map_inited = true; // 标记为已初始化
 }
 
-// 新增：初始化边代价索引表
+// 初始化边代价索引（仅做就绪标记与边表自检，不再建立稠密矩阵）
 void edge_map_init(Map *map)
 {
     if (g_edge_map_inited)
@@ -358,26 +362,48 @@ void edge_map_init(Map *map)
         return;
     }
 
-    // 初始化所有值为-1.0f（表示无对应边）
-    memset(g_edge_cost_map, 0xFF, sizeof(g_edge_cost_map)); // 利用浮点数特性，0xFF对应-1.0f（视平台而定，也可循环赋值）
-
-    // 遍历所有边，填充索引表
-    for (uint8_t i = 0; i < global_map.edge_count; i++)
+    // 自检：清点有效边数（node1/node2 需在 ID 范围内）
+    uint8_t valid = 0;
+    for (uint8_t i = 0; i < map->edge_count && i < (uint8_t)(sizeof(map->edges) / sizeof(map->edges[0])); i++)
     {
-        Edge *edge = &global_map.edges[i];
-        uint8_t id1 = edge->node1;
-        uint8_t id2 = edge->node2;
-        if (id1 < MAX_NODE_ID && id2 < MAX_NODE_ID)
+        if (map->edges[i].node1 < MAX_NODE_ID && map->edges[i].node2 < MAX_NODE_ID)
         {
-            g_edge_cost_map[id1][id2] = edge->cost;
-            g_edge_cost_map[id2][id1] = edge->cost; // 无向边双向映射
+            valid++;
         }
+    }
+    if (valid == 0)
+    {
+#if DEBUG_PRINT
+        log_print("map->edge_map_init: no valid edge, keep uninitialized\r\n");
+#endif
+        return;
     }
 
     g_edge_map_inited = true;
 #if DEBUG_PRINT
     log_print("map->The initialization of the edge index table has been completed\r\n");
 #endif
+}
+
+// 按节点 ID 查询边代价（无向图，两个方向都试）。找不到返回 false。
+// 单趟线性扫描 edges（实际 105 条，上限 400），在 72MHz 的 M3 上是微秒级开销；
+// 换来的是省下 40KB SRAM——F103C8T6 总共只有 20KB。
+bool map_edge_cost(uint8_t id1, uint8_t id2, float *cost)
+{
+    if (cost == NULL || id1 >= MAX_NODE_ID || id2 >= MAX_NODE_ID)
+    {
+        return false;
+    }
+    for (uint8_t i = 0; i < global_map.edge_count; i++)
+    {
+        const Edge *e = &global_map.edges[i];
+        if ((e->node1 == id1 && e->node2 == id2) || (e->node1 == id2 && e->node2 == id1))
+        {
+            *cost = e->cost;
+            return true;
+        }
+    }
+    return false;
 }
 
 // 【核心优化】辅助函数：获取节点指针（通过ID）—— 用映射表替代遍历查找

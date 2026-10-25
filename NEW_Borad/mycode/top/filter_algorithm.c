@@ -69,10 +69,10 @@ void ComplementaryFilter_Update(Attitude *attitude, const SensorData *sensor, fl
         return;
     }
 
-    // 计算加速度计角度
+    // 计算加速度计角度（atan2f：arm_atan2_f32 已删——F103C8T6 无 FPU，工程不带 CMSIS-DSP）
     float roll_acc, pitch_acc;
-    arm_atan2_f32(sensor->acc_y, sensor->acc_z, &roll_acc);
-    arm_atan2_f32(-sensor->acc_x, sqrtf(sensor->acc_y * sensor->acc_y + sensor->acc_z * sensor->acc_z), &pitch_acc);
+    roll_acc = atan2f(sensor->acc_y, sensor->acc_z);
+    pitch_acc = atan2f(-sensor->acc_x, sqrtf(sensor->acc_y * sensor->acc_y + sensor->acc_z * sensor->acc_z));
 
     // 陀螺仪积分
     attitude->roll += (sensor->gyro_x - attitude->gyro_offset[0]) * dt;

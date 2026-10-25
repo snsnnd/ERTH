@@ -17,7 +17,10 @@
 #define MAP_LEFT_ANGLE (-3.1415927f) // 向左（-x方向）：-180° = -π（与 +π 等价，环绕归一化后等价）
 
 // 弧度制常量定义（全局）
+// 原 #define M_PI ... 会与 math.h 的 M_PI 冲突（gcc -Wall 报 "M_PI redefined"），改用兜底定义
+#ifndef M_PI
 #define M_PI 3.1415926535f
+#endif
 #define TWO_PI (2 * M_PI)     // 2π 弧度（对应360°）
 #define HALF_PI (M_PI / 2.0f) // π/2 弧度（对应90°，常用目标值）
 // calculate_angle_diff 的环绕归一化依赖 PI：仓库内未定义 PI 时用本文件的 M_PI 兜底

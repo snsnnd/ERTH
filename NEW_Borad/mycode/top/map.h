@@ -45,7 +45,8 @@ extern Map global_map;
 #define MAX_NODE_ID 100
 extern int16_t g_node_id_to_idx[MAX_NODE_ID];
 extern bool g_node_map_inited; // 映射表是否已初始化
-extern float g_edge_cost_map[MAX_NODE_ID][MAX_NODE_ID];
+// 注：原 float g_edge_cost_map[100][100]（40KB 稠密邻接矩阵）已删——F103C8T6 只有 20KB SRAM，
+// 改为下面这个按需线性查询（走 global_map.edges）
 extern bool g_edge_map_inited;
 
 // 工具函数声明
@@ -57,6 +58,7 @@ bool map_validate(const Map *map);
 void map_get_bounds(const Map *map, float *min_x, float *max_x, float *min_y, float *max_y);
 void map_globalmap_init_id_map(Map *map);
 void edge_map_init(Map *map);
+bool map_edge_cost(uint8_t id1, uint8_t id2, float *cost); // 查边代价（无向，找不到返回 false）
 Node *get_node_by_id(uint8_t node_id);
 
 #endif // MAP_H

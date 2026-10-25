@@ -2,7 +2,7 @@
 #define KINEMATICS_H
 
 #include "sensor.h"
-#include "arm_math.h"
+// arm_math.h 已删：STM32F103C8T6（Cortex-M3，无 FPU）工程不带 CMSIS-DSP，改用 math.h
 
 // 机器人机械参数
 #define WHEEL_BASE 0.30f    // 轴距(m)

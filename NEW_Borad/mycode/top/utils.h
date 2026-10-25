@@ -1,8 +1,9 @@
 #ifndef UTILS_H
 #define UTILS_H
 
-#include "stm32f4xx.h"
-#include "arm_math.h"
+#include "stm32f1xx.h"
+#include <stdint.h>
+// arm_math.h 已删：STM32F103C8T6（Cortex-M3，无 FPU）工程不带 CMSIS-DSP
 
 // 地图比例尺：1 地图单位 = 0.01 米（即 1 厘米）
 #define MAP_SCALE 0.01f

@@ -1,7 +1,7 @@
 #ifndef TRACK_PID_H
 #define TRACK_PID_H
 
-#include "stm32f4xx_hal.h"
+#include "stm32f1xx_hal.h" // 实际 MCU：STM32F103C8T6
 #include "hd.h"
 
 // 传感器通道定义（8路，从左到右）

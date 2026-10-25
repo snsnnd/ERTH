@@ -2,6 +2,7 @@
 #include "stdlib.h"
 #include "oledfont.h"
 #include "delay.h"
+#include "iic_mpu6050.h" // SOFT_I2C_*：OLED 与 MPU6050 共用 PB8/PB9 软 I2C 总线
 
 u8 OLED_GRAM[128][8];
 
@@ -18,24 +19,20 @@ void OLED_Refresh_Gram(void)
     }
 }
 
+/**
+ * @brief  写一个字节到 SSD1306（I2C 事务：从地址 + 控制字节 + 数据）
+ * @param  dat: 待写字节
+ * @param  cmd: OLED_CMD(0)=命令，OLED_DATA(1)=显存数据
+ * @note   原为 4 线软件 SPI 位翻转时序（PD11~PD14），因实际硬件是 I2C 4 针且
+ *         F103C8T6 无 GPIOD 而重写；控制字节 0x00(命令)/0x40(数据) 取代 D/C 引脚。
+ */
 void OLED_WR_Byte(u8 dat, u8 cmd)
 {
-    u8 i;
-    if (cmd)
-        OLED_RS_Set();
-    else
-        OLED_RS_Clr();
-    for (i = 0; i < 8; i++)
-    {
-        OLED_SCLK_Clr();
-        if (dat & 0x80)
-            OLED_SDIN_Set();
-        else
-            OLED_SDIN_Clr();
-        OLED_SCLK_Set();
-        dat <<= 1;
-    }
-    OLED_RS_Set();
+    SOFT_I2C_Start();
+    SOFT_I2C_SendByte(0x78);               // SSD1306 从机地址 0x3C << 1 | 写
+    SOFT_I2C_SendByte(cmd ? 0x40 : 0x00);  // 控制字节：0x40=后续为数据，0x00=后续为命令
+    SOFT_I2C_SendByte(dat);
+    SOFT_I2C_Stop();
 }
 
 void OLED_Display_On(void)

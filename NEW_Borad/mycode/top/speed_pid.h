@@ -1,7 +1,7 @@
 #ifndef SPEED_PID_H
 #define SPEED_PID_H
 
-#include "stm32f4xx_hal.h" // 替换为实际MCU的HAL头文件
+#include "stm32f1xx_hal.h" // 实际 MCU：STM32F103C8T6（原理图卡片）
 
 // 速度环参数宏定义（根据硬件调整）
 #define SPEED_MAX_TARGET 30  // 最大目标速度（如rpm或PWM值）

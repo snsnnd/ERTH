@@ -1,10 +1,9 @@
 #include "position.h"
-#include "arm_math.h" // 用于浮点运算加速
-#include <math.h>     // 用于NaN检查
+#include <math.h> // NaN 检查 + sqrtf（arm_math.h 已删：F1 工程无 CMSIS-DSP）
 #include "map.h"
 #include "BT.h"
 
-// 定义全局中断开关宏，适配STM32F4系列
+// 定义全局中断开关宏（Cortex-M3 通用 __disable_irq/__enable_irq）
 #define ENTER_CRITICAL() __disable_irq() // 关闭全局中断（进入临界区）
 #define EXIT_CRITICAL() __enable_irq()   // 开启全局中断（退出临界区）
 

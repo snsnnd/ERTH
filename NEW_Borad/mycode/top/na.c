@@ -3,8 +3,7 @@
 #include <limits.h> // 用于UINT_MAX
 #include <stdbool.h>
 #include <string.h>   // 用于memset
-#include <math.h>     // 用于isnan或比较
-#include "arm_math.h" // CMSIS-DSP for optimized math
+#include <math.h>     // 用于isnan或比较 + sqrtf（arm_math.h 已删：F1 工程无 CMSIS-DSP）
 #include "BT.h"
 
 // 外部全局地图
@@ -37,10 +36,10 @@ static float get_edge_cost(uint8_t node1_id, uint8_t node2_id)
         return -1.0f;
     }
 
-    // 直接从索引表获取代价
-    float cost = g_edge_cost_map[node1_id][node2_id];
-    if (cost < 0.0f)
-    { // 未找到对应边（初始化为-1.0f）
+    // 按需查边代价（走 edges 线性扫描；原 40KB 稠密矩阵已删，F103C8T6 只有 20KB RAM）
+    float cost;
+    if (!map_edge_cost(node1_id, node2_id, &cost))
+    {
 #if DEBUG_PRINT
         log_print("Edge not found\n");
         log_print("%d -> %d\r\n", node1_id, node2_id);
@@ -114,7 +113,7 @@ static bool find_closest_node_core(float x_map, float y_map, uint8_t *node_id)
         float dx = x_map - node->x;
         float dy = y_map - node->y;
         float dist;
-        arm_sqrt_f32(dx * dx + dy * dy, &dist);
+        dist = sqrtf(dx * dx + dy * dy);
 #if DEBUG_PRINT
         log_print("na->  Node ID: %d, Node coordinates (%.2f, %.2f), Distance: %.2f\r\n",
                   node->node_id, node->x, node->y, dist);

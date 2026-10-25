@@ -1,24 +1,21 @@
 #ifndef __OLED_H
 #define __OLED_H
 
-#include "sys.h"
+#include "stdint.h"
 
 #define u8 uint8_t
 #define u32 uint32_t
 
-#define OLED_RST_Clr() PDout(12) = 0 // RST
-#define OLED_RST_Set() PDout(12) = 1 // RST
+// 实际硬件（校赛原理图）：OLED 为 I2C 4 针（VCC/GND/SCL/SDA），SCL/SDA 走 PB8/PB9
+// 软件 I2C 总线，与 MPU6050 共用（R12 10k 上拉）。该模块没有独立的 RST 与 D/C 引脚：
+// RST 由上电自复位完成，D/C 改由 I2C 控制字节（0x00 命令 / 0x40 数据）代替。
+// 原 4 线软件 SPI 时序（PD11~PD14 位带宏）已废弃——STM32F103C8T6 没有 GPIOD，
+// 且原理图上不存在这 4 根线。
+#define OLED_RST_Clr() ((void)0)
+#define OLED_RST_Set() ((void)0)
 
-#define OLED_RS_Clr() PDout(11) = 0 // DC
-#define OLED_RS_Set() PDout(11) = 1 // DC
-
-#define OLED_SCLK_Clr() PDout(14) = 0 // SCL
-#define OLED_SCLK_Set() PDout(14) = 1 // SCL
-
-#define OLED_SDIN_Clr() PDout(13) = 0 // SDA
-#define OLED_SDIN_Set() PDout(13) = 1 // SDA
-#define OLED_CMD 0                    // Command
-#define OLED_DATA 1                   // Data
+#define OLED_CMD 0  // 命令
+#define OLED_DATA 1 // 数据
 
 // Oled control function
 

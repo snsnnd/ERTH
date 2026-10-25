@@ -122,8 +122,6 @@ float calculate_distance(float x1, float y1, float x2, float y2)
     }
     float dx = x2 - x1;
     float dy = y2 - y1;
-    float sq_dist = dx * dx + dy * dy;
-    float dist;
-    arm_sqrt_f32(sq_dist, &dist);
-    return dist;
+    // sqrtf（arm_sqrt_f32 已删：F103C8T6 无 FPU，工程不带 CMSIS-DSP）
+    return sqrtf(dx * dx + dy * dy);
 }
