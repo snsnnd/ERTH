@@ -15,7 +15,8 @@
 // 循迹数据(track_data:)
 
 // 外部声明UART句柄（由CubeMX生成，在usart.c中定义）
-extern UART_HandleTypeDef huart2;
+// 实际硬件：蓝牙 SPP 接原理图 H7 串口（PB10/PB11）= USART3
+extern UART_HandleTypeDef huart3;
 
 /**
  * @brief  蓝牙模块初始化（含UART和模块参数配置）
@@ -57,6 +58,6 @@ void bt_send_line(const char *s);
 void bt_test(void);
 
 // 说明：全工程唯一的 HAL_UART_RxCpltCallback 强定义位于 BT.c，
-//       按 huart->Instance 分发：USART2 → 蓝牙行缓冲；USART5 → n10_rx_byte()
+//       唯一下行通道 USART3 → 蓝牙行缓冲（原 USART5→n10 雷达分支已删）
 
 #endif

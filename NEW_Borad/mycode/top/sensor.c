@@ -103,7 +103,7 @@ uint8_t sensor_hd_read_digital(Track_SensorTypeDef *track)
         return 0; // 避免空指针访问
     }
 
-    track->sensor = HD_Serial_Read();
+    track->sensor = HD_Parallel_Read();
     // 协议遥测（非调试日志）：上位机 final.py 按 "track_data:" 前缀解析，
     // 属对战/调试平台协议字段，故意不受 DEBUG_PRINT 控制
     log_print("track_data:%hu\n", track->sensor);
@@ -177,98 +177,5 @@ Track_SceneTypeDef sensor_hd_judge_scene(Track_SensorTypeDef *track)
     return TRACK_SCENE_STRAIGHT;
 }
 
-// *************************  激光雷达  *********************************/
-float sensor_get_distance(void)
-{
-    float distances[16];
-    float angles[16];
-    int16_t point_count = n10_get_angles_and_distances(angles, distances, 16);
-
-    if (point_count != 16)
-    {
-#if DEBUG_PRINT
-        log_print("sensor_get_distance: Failed to get valid points\r\n");
-#endif
-        return -1.0f; // 返回-1表示获取失败
-    }
-
-    // 取最近的有效距离（忽略0值，假设0为无效数据）
-    float min_distance = -1.0f;
-    for (uint8_t i = 0; i < 16; i++)
-    {
-        if (distances[i] > 0.0f) // 有效距离判断
-        {
-            if (min_distance < 0 || distances[i] < min_distance)
-            {
-                min_distance = distances[i];
-            }
-        }
-    }
-
-#if DEBUG_PRINT
-    if (min_distance >= 0)
-        log_print("sensor_get_distance: %.3f m\r\n", min_distance);
-    else
-        log_print("sensor_get_distance: No valid distance data\r\n");
-#endif
-
-    return min_distance;
-}
-
-float sensor_get_angle(void)
-{
-    float distances[16];
-    float angles[16];
-    int16_t point_count = n10_get_angles_and_distances(angles, distances, 16);
-
-    if (point_count != 16)
-    {
-#if DEBUG_PRINT
-        log_print("sensor_get_angle: Failed to get valid points\r\n");
-#endif
-        return -1.0f; // 返回-1表示获取失败
-    }
-
-    // 取最近有效距离对应的角度
-    float min_distance = -1.0f;
-    float target_angle = -1.0f;
-    for (uint8_t i = 0; i < 16; i++)
-    {
-        if (distances[i] > 0.0f) // 有效距离判断
-        {
-            if (min_distance < 0 || distances[i] < min_distance)
-            {
-                min_distance = distances[i];
-                target_angle = angles[i];
-            }
-        }
-    }
-
-#if DEBUG_PRINT
-    if (target_angle >= 0)
-        log_print("sensor_get_angle: %.2f degrees\r\n", target_angle);
-    else
-        log_print("sensor_get_angle: No valid angle data\r\n");
-#endif
-
-    return target_angle;
-}
-
-float sensor_get_rotation_speed(void)
-{
-    N10_PointCloud_FrameTypeDef frame;
-    if (n10_process_frame(&frame) != 1)
-    {
-#if DEBUG_PRINT
-        log_print("sensor_get_rotation_speed: Failed to get valid frame\r\n");
-#endif
-        return -1.0f; // 返回-1表示获取失败
-    }
-
-    float speed = n10_get_speed(&frame);
-#if DEBUG_PRINT
-    log_print("sensor_get_rotation_speed: %.2f Hz\r\n", speed);
-#endif
-
-    return speed;
-}
+// 激光雷达三接口（sensor_get_distance / sensor_get_angle /
+// sensor_get_rotation_speed，依赖 n10_* 点云解析）已随雷达模块删除

@@ -128,7 +128,7 @@ void Track_ControlMotor(float pi_output, int *left_speed, int *right_speed)
 #include "motor.h"
 uint8_t Track_MainControl(int *left_speed, int *right_speed)
 {
-    uint16_t sensor_data = HD_Serial_Read();
+    uint16_t sensor_data = HD_Parallel_Read();
     if (sensor_data == 255)
     {
         motor_stop();

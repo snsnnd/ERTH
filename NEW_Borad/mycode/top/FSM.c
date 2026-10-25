@@ -1,6 +1,6 @@
 #include "FSM.h"
 #include "arm_math.h"
-#include "Lidra.h"
+// Lidra.h（雷达点云聚类）已随雷达模块删除：敌人坐标改由对战平台 ORP 下发
 #include "control.h"
 #include <math.h>
 #include <string.h> // strncmp：对战协议下行解析
@@ -108,7 +108,6 @@ void robot_init(RobotController *robot, uint8_t init_id, float init_x, float ini
     // 初始化中断标志位和锁
     robot->irq_flags.track_update_flag = 0;
     robot->irq_flags.position_update_flag = 0;
-    robot->irq_flags.lidar_update_flag = 0;
     robot->irq_flags.data_lock = 0;
     robot->irq_flags.irq_nest_count = 0;
 
@@ -185,6 +184,11 @@ static void robot_protocol_update(RobotController *robot, const Pose *pose)
                     robot->oppo_valid = 1;
                     robot->oppo_last_ms = timer_get_ms();
                     EXIT_CRITICAL();
+                    // ORP 接管敌人坐标（原雷达点云聚类已删）：
+                    // ORP 为地图坐标，enemy_x/y 语义为真实（米）坐标
+                    // （na.c find_closest_node_enemy 内做 real_to_map），
+                    // 故经 map_to_real 换算后写入（内部含临界区）
+                    robot_set_enemy(robot, map_to_real(ox), map_to_real(oy));
 #if DEBUG_PRINT
                     log_print("FSM->ORP: (%.1f,%.1f)\r\n", ox, oy);
 #endif
@@ -208,6 +212,9 @@ static void robot_protocol_update(RobotController *robot, const Pose *pose)
         GetTickDiffMs(robot->oppo_last_ms, now) > OPPONENT_TIMEOUT_MS)
     {
         robot->oppo_valid = 0;
+        robot->has_enemy = 0; // 对手位置过期 → 敌人同步失效（原雷达的 has_enemy 归属）
+        robot->enemy_x = -1.0f;
+        robot->enemy_y = -1.0f;
     }
     float oppo_x = robot->oppo_x;
     float oppo_y = robot->oppo_y;
@@ -296,40 +303,8 @@ void robot_update(RobotController *robot)
 #endif
     }
 
-    // 处理雷达更新标志位（临界区内只取值/清标志；log_print 为阻塞串口
-    // 输出，严禁在临界区内调用，打印统一放到 EXIT_CRITICAL 之后）
-    uint8_t lidar_flag;
-    ENTER_CRITICAL();
-    lidar_flag = robot->irq_flags.lidar_update_flag;
-    if (lidar_flag)
-    {
-        robot->irq_flags.lidar_update_flag = 0;
-    }
-    EXIT_CRITICAL();
-#if DEBUG_PRINT
-    // 打印的是清零前捕获到的局部变量；%n 为写内存的危险格式符，已改为 %d
-    log_print("lidar_flag:%d\n", lidar_flag);
-    if (lidar_flag)
-    {
-        log_print("lidar_update_flag:%d\n", lidar_flag);
-    }
-#endif
-
-    if (lidar_flag)
-    {
-#if DEBUG_PRINT
-        if (robot->has_enemy)
-        {
-            float x = real_to_map(robot->enemy_x);
-            float y = real_to_map(robot->enemy_y);
-            log_print("enemy:(%.1f, %.1f)\n", x, y);
-        }
-        else
-        {
-            log_print("enemy:(-1.0, -1.0)\n");
-        }
-#endif
-    }
+    // 雷达更新标志段已删除（雷达模块舍弃；敌人坐标改由对战协议 ORP 驱动，
+    // 见 robot_protocol_update 中 ORP 解析 → robot_set_enemy）
 
     // 处理循迹数据标志位
     ENTER_CRITICAL();
@@ -612,7 +587,7 @@ void robot_get_pose(RobotController *robot, Pose *pose)
 /*
  *初始化函数:
  *    蓝牙
- *    传感器：循迹，编码器，MPU6050，雷达
+ *    传感器：循迹，编码器，MPU6050（雷达已随硬件方案舍弃）
  *    工具：滤波器，地图，导航，定位
  */
 void init(RobotController *robot)
@@ -633,8 +608,7 @@ void init(RobotController *robot)
         log_print("MPU6050 init success!\r\n");
     }
 
-    // 雷达 UART 接收中断启动（恢复调用，否则 lidar_it 读不到数据）
-    n10_init();
+    // （原 n10_init()：雷达 UART 接收中断启动——雷达模块已舍弃，删除）
 
     // 编码器初始化（encoder_init 内部已调用 encoder_setparam(13,4,6.5f)，
     // 此处原先重复调用一次，属死重复，已删除）
@@ -703,33 +677,8 @@ void position_it(RobotController *robot)
     robot->irq_flags.position_update_flag = 1;
 }
 
-/*
- *  中断函数，50ms一次，检测敌人位置
- */
-void lidar_it(RobotController *robot)
-{
-    if (robot == NULL)
-        return;
-
-    float distance = sensor_get_distance();
-    float angle = sensor_get_angle();
-    SingleMassPoint temp_mass_point;
-
-    ENTER_CRITICAL(); // 合并临界区范围（仅修改共享数据）
-    if (FilterModule_Process(distance, angle, &temp_mass_point) == 0)
-    {
-        robot->enemy_x = temp_mass_point.centroid_x;
-        robot->enemy_y = temp_mass_point.centroid_y;
-        robot->has_enemy = 1;
-    }
-    else
-    {
-        robot->has_enemy = 0;
-    }
-    EXIT_CRITICAL();
-
-    robot->irq_flags.lidar_update_flag = 1; // 统一设置标志位
-}
+// lidar_it() 已删除：雷达模块（N10/USART5 + 点云聚类）随硬件方案舍弃，
+// 敌人坐标统一由对战平台 ORP 下发（robot_protocol_update → robot_set_enemy）
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
@@ -751,13 +700,5 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         position_it(&global_robot);
     }
 
-    if (htim->Instance == TIM12)
-    { // 判断是否为TIM12中断
-#if DEBUG_PRINT
-        log_print("50ms\n");
-#endif
-        // 注：TIM7/TIM12 的启动在仓库外的 main/CubeMX 代码中；
-        // 若外部未启动这两个定时器，本调用自然不会触发
-        lidar_it(&global_robot);
-    }
+    // TIM12（原 50ms 雷达中断）分支已删除：雷达模块舍弃后不再需要
 }

@@ -4,7 +4,7 @@
 #include "stdint.h"
 #include "hd.h"
 #include "encoder.h"
-#include "Lidra_driver.h"
+// Lidra_driver.h 已删（雷达模块舍弃）
 #include "mpu6050.h"
 
 /***************************  循迹  ********************************/
@@ -76,13 +76,10 @@ void sensor_mpu_acc_tra(MPU_SensorTypeDef *mpu);
 void sensor_mpu_gyro_tra(MPU_SensorTypeDef *mpu);
 
 /***************************  循迹传感器  ********************************/
-int get_digitaldata(uint8_t *data);
 uint8_t sensor_hd_read_digital(Track_SensorTypeDef *track);
 Track_SceneTypeDef sensor_hd_judge_scene(Track_SensorTypeDef *track);
 
-// *************************  激光雷达  *********************************/
-float sensor_get_distance(void);       // 获取单个点的距离（单位：m）
-float sensor_get_angle(void);          // 获取单个点的角度（单位：°，顺时针，0°朝右）
-float sensor_get_rotation_speed(void); // 获取雷达转速（单位：Hz，可选）
+// 激光雷达接口（sensor_get_distance/angle/rotation_speed）已删除：
+// 雷达模块（N10/USART5 + 点云聚类）随硬件方案舍弃
 
 #endif

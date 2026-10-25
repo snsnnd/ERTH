@@ -19,7 +19,7 @@ typedef struct
     volatile uint8_t data_lock; // 简单的数据锁
     volatile uint8_t track_update_flag;
     volatile uint8_t position_update_flag;
-    volatile uint8_t lidar_update_flag;
+    // lidar_update_flag 已删（雷达模块舍弃；敌人由对战协议 ORP 驱动）
     volatile uint32_t irq_nest_count; // 新增：中断嵌套计数器
 } InterruptFlags;
 
@@ -74,7 +74,7 @@ void robot_emergency_stop(RobotController *robot);
 void init(RobotController *robot);
 void loop(RobotController *robot);
 
-void lidar_it(RobotController *robot);
+// lidar_it() 已删（雷达模块舍弃）
 void position_it(RobotController *robot);
 void hd_it(RobotController *robot);
 

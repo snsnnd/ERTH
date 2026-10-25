@@ -2,7 +2,8 @@
 #include "sensor.h"
 #include "motor.h"
 #include "track_pid.h"
-#include "speed_pid.h"
+// speed_pid.h 已不引用：速度环 PID 停调（speed_pid.c/h 模块保留但不再调用），
+// 差速两驱开环直驱，见 forward() 内 OPEN_LOOP_PWM_GAIN
 #include "BT.h"
 #include <math.h>
 #include <stdio.h>
@@ -28,10 +29,10 @@
 
 #define TURN_SPEED 50
 
-extern SpeedPID_HandleTypeDef *fl_pid;
-extern SpeedPID_HandleTypeDef *fr_pid;
-extern SpeedPID_HandleTypeDef *bl_pid;
-extern SpeedPID_HandleTypeDef *br_pid;
+// 开环增益：循迹环输出量级 10~30（track_pid.h BASE/MAX/MIN_SPEED），
+// 直接作为 PWM 只有 10%~30% 占空比，动力不足；×3 映射到 30~90（PWM_MAX=100）。
+// 速度环恢复时删除本宏并重新接入 SpeedPID 即可（模块仍在 speed_pid.c）
+#define OPEN_LOOP_PWM_GAIN 3
 
 /**
  * 计算当前角度与目标角度的差值（归一化到 -π ~ π 弧度）
@@ -55,47 +56,19 @@ static float calculate_angle_diff(float target_rad, float current_rad)
 // 1. 参数改为指针，确保结构体状态能被持续更新
 void forward()
 {
-    ENCODER_SensorTypeDef encoder_instance;             // 结构体实例
-    ENCODER_SensorTypeDef *encoder = &encoder_instance; // 指针指向实例
-    sensor_encoder(encoder);                            // 传入指针，正确读取数据
-
     int track_left, track_right;
-    float fl_pwm, fr_pwm, bl_pwm, br_pwm;
 
-    // 1. 循迹控制：使用指针访问结构体，确保状态更新
+    // 1. 循迹控制：输出左右目标速度（10~30）
     Track_MainControl(&track_left, &track_right);
 
-    // 2. 速度闭环：每个电机独立使用自己的PID结构体和编码器反馈
-    // 左前电机（假设独立编码器）
-    SpeedPID_SetTarget(fl_pid, track_left);
-    SpeedPID_SetCurrent(fl_pid, encoder->lf_speed); // 独立读取左前速度
-    fl_pwm = SpeedPID_Compute(fl_pid);
-
-    // 右前电机
-    SpeedPID_SetTarget(fr_pid, track_right);
-    SpeedPID_SetCurrent(fr_pid, encoder->rf_speed); // 独立读取右前速度
-    fr_pwm = SpeedPID_Compute(fr_pid);
-
-    // 左后电机
-    SpeedPID_SetTarget(bl_pid, track_left);
-    SpeedPID_SetCurrent(bl_pid, encoder->lb_speed); // 独立读取左后速度
-    bl_pwm = SpeedPID_Compute(bl_pid);
-
-    // 右后电机
-    SpeedPID_SetTarget(br_pid, track_right);
-    SpeedPID_SetCurrent(br_pid, encoder->rb_speed); // 独立读取右后速度
-    br_pwm = SpeedPID_Compute(br_pid);
-
-    // 3. 转换为整数PWM并输出
-    int16_t fl_pwm_int = (int16_t)round(fl_pwm);
-    int16_t fr_pwm_int = (int16_t)round(fr_pwm);
-    int16_t bl_pwm_int = (int16_t)round(bl_pwm);
-    int16_t br_pwm_int = (int16_t)round(br_pwm);
-
-    motor_setspeed(motor_front_left, fl_pwm_int);
-    motor_setspeed(motor_front_right, fr_pwm_int);
-    motor_setspeed(motor_back_left, bl_pwm_int);
-    motor_setspeed(motor_back_right, br_pwm_int);
+    // 2. 速度环停调（原 SpeedPID_SetTarget/SetCurrent/Compute 四轮闭环已删，
+    //    模块保留于 speed_pid.c 未被调用）：开环经增益映射为 PWM 直接输出。
+    //    差速两驱：同侧两枚举在 motor.c 内合并为一路 TB6612 输出，
+    //    故每侧只需一次调用
+    int16_t pwm_left = (int16_t)(track_left * OPEN_LOOP_PWM_GAIN);
+    int16_t pwm_right = (int16_t)(track_right * OPEN_LOOP_PWM_GAIN);
+    motor_setspeed(motor_front_left, pwm_left);  // 左侧（A 路）
+    motor_setspeed(motor_front_right, pwm_right); // 右侧（B 路）
 }
 
 int map_dir_to_robot_action(Direction map_dir, float *current_pose)

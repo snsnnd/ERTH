@@ -4,10 +4,9 @@
 #include "main.h"
 #include "stdbool.h"
 
-extern TIM_HandleTypeDef htim2; // 编码器A
-extern TIM_HandleTypeDef htim3; // 编码器B
-extern TIM_HandleTypeDef htim4; // 编码器C
-extern TIM_HandleTypeDef htim5; // 编码器D
+extern TIM_HandleTypeDef htim2; // 编码器左路（PA0/PA1，H15）
+extern TIM_HandleTypeDef htim4; // 编码器右路（PB6/PB7，H14）
+// 实际硬件仅 2 路编码器：同侧前后轮共用一路（htim3 已改作 PWM 输出）
 
 enum ENCODER
 {

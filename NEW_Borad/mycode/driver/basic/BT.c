@@ -1,20 +1,21 @@
 #include "BT.h"
-#include "Lidra_driver.h" // 供 HAL_UART_RxCpltCallback 分发 huart5 → n10_rx_byte()
 #include <string.h>
 #include <stdio.h>
 
 // 模块内部宏定义
-#define BT_USART_HANDLE &huart2 // 指向CubeMX生成的UART句柄
+// 实际硬件（校赛原理图 H7 串口）：蓝牙 SPP 模块接 PB10/PB11 = USART3，
+// 故句柄由原 huart2 改为 huart3（CubeMX 需同步开启 USART3，见交付清单）
+#define BT_USART_HANDLE &huart3 // 指向CubeMX生成的UART句柄
 #define BT_BAUDRATE 115200
 #define PRINT_BUF_SIZE 256 // 打印缓冲区大小
 
-// ---------------- 对战协议下行接收（UART2 单字节中断 → 完整行队列） ----------------
+// ---------------- 对战协议下行接收（UART3 单字节中断 → 完整行队列） ----------------
 #define BT_RX_LINE_QUEUE 5 // 完整行队列槽数（单生产者单消费者，有效容量 = 槽数-1 = 4）
 
 // 模块内部函数声明
 static void bt_module_config(void); // 蓝牙模块AT指令配置
 
-// 接收状态（全部由 UART2 中断上下文写入装配缓冲，主循环只读成品行队列）
+// 接收状态（全部由 UART3 中断上下文写入装配缓冲，主循环只读成品行队列）
 static uint8_t bt_rx_byte;                         // HAL_UART_Receive_IT 单字节缓冲
 static volatile char bt_asm_buf[BT_LINE_MAX];      // 行装配缓冲（中断上下文）
 static volatile uint16_t bt_asm_len;               // 当前装配长度
@@ -42,7 +43,7 @@ static void bt_push_line(void)
 }
 
 /**
- * @brief  中断上下文：UART2 单字节行装配（含溢出保护与重新同步）
+ * @brief  中断上下文：UART3 单字节行装配（含溢出保护与重新同步）
  * 规则：'\n' 为行界；'\r' 忽略；超长则丢弃本行并进入丢弃模式直到下一个 '\n'
  */
 static void bt_rx_byte_handler(uint8_t byte)
@@ -84,9 +85,8 @@ static void bt_rx_byte_handler(uint8_t byte)
 
 /**
  * @brief  全工程唯一的 UART 接收完成回调（强定义）
- * 按 huart->Instance 分发：
- *   USART2 → 蓝牙 SPP 行协议（对战协议 ORP/ERR 下行）
- *   USART5 → N10 雷达（转发给从 Lidra_driver.c 抽出的 n10_rx_byte）
+ * 唯一下行通道：USART3（蓝牙 SPP 行协议，对战协议 ORP/ERR 下行）
+ * （原按 Instance 分发的 USART5 → N10 雷达分支已随雷达模块一并删除）
  */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
@@ -95,15 +95,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         return;
     }
 
-    if (huart->Instance == USART2)
+    if (huart->Instance == USART3)
     {
         bt_rx_byte_handler(bt_rx_byte);
         // 重启下 1 字节接收（HAL 需手动重启；禁止在其中发送数据）
         HAL_UART_Receive_IT(BT_USART_HANDLE, &bt_rx_byte, 1);
-    }
-    else if (huart->Instance == USART5)
-    {
-        n10_rx_byte(); // Lidra_driver.c 中抽取的处理 + 接收重启
     }
 }
 
@@ -112,7 +108,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
  */
 void bt_init(void)
 {
-    // UART初始化由CubeMX生成的MX_USART2_UART_Init()完成
+    // UART初始化由CubeMX生成的MX_USART3_UART_Init()完成
     // 此处只需进行模块参数配置
     bt_module_config();
 
