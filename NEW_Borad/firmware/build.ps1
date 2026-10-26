@@ -1,4 +1,4 @@
-<#
+﻿<#
   STM32F103C8T6 小车固件 一键构建脚本（Windows）
   流程：CubeMX 无头生成 MDK-ARM 工程 -> 挂载 mycode -> 注入 main.c 入口 -> UV4 编译
 

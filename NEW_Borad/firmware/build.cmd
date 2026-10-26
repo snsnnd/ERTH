@@ -1,10 +1,10 @@
 @echo off
 rem =========================================================
-rem  STM32F103C8T6 å°è½¦å›ºä»¶ ä¸€é”®æ„å»ºï¼ˆåŒå‡»å³å¯ï¼‰
-rem  æµç¨‹ï¼šCubeMX æ— å¤´ç”Ÿæˆ MDK-ARM å·¥ç¨‹ -> æŒ‚è½½ mycode
-rem        -> æ³¨å…¥ main.c å…¥å£ -> UV4 ç¼–è¯‘
-rem  å·¥ç¨‹è½åœ°åœ¨ D:\tmp_my\STM32F103C8_Car
-rem  å‚æ•°ä¼šåŸæ ·è½¬ç»™ build.ps1ï¼Œä¾‹å¦‚ï¼š
+rem  STM32F103C8T6 Ğ¡³µ¹Ì¼ş Ò»¼ü¹¹½¨£¨Ë«»÷¼´¿É£©
+rem  Á÷³Ì£ºCubeMX ÎŞÍ·Éú³É MDK-ARM ¹¤³Ì -> ¹ÒÔØ mycode
+rem        -> ×¢Èë main.c Èë¿Ú -> UV4 ±àÒë
+rem  ¹¤³ÌÂäµØÔÚ D:\tmp_my\STM32F103C8_Car
+rem  ²ÎÊı»áÔ­Ñù×ª¸ø build.ps1£¬ÀıÈç£º
 rem    build.cmd -NoGenerate
 rem    build.cmd -MxToolchain "MDK-ARM V5"
 rem    build.cmd -CubemxRoot "E:\STM32CUBEMX" -Uv4Path "C:\Keil\UV4\UV4.exe"
