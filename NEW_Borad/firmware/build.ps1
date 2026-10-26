@@ -170,6 +170,11 @@ $uvText = [IO.File]::ReadAllText($Uvprojx)
 # 5.1 头文件搜索路径（Cads/Aads 各可能一份，全部追加；每次都是新生成的工程，无需去重）
 $uvText = [regex]::Replace($uvText, '(<IncludePath>)([^<]*)(</IncludePath>)', ('$1$2;' + $IncPath + '$3'))
 
+# 5.1b 压制中文导致的编码告警：源码统一 UTF-8，而 Keil 默认按本机 GBK locale 解析，
+#      中文字符串会报 #870-D invalid multibyte character sequence
+$diagFlag = if ($MxToolchain -match 'V6') { '-Wno-invalid-source-encoding' } else { '--diag_suppress=870' }
+$uvText = [regex]::Replace($uvText, '(<MiscControls>)([^<]*)(</MiscControls>)', ('$1$2 ' + $diagFlag + '$3'))
+
 # 5.2 mycode 源文件组
 $filesXml = ($CSources | ForEach-Object {
         $rel = $CodeRoot + ($_.FullName.Substring($Dst.Length) -replace '/', '\')
