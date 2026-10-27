@@ -1,0 +1,12 @@
+[project]
+name = "erth-bt"
+version = "0.1.0"
+description = "BLE/串口 PID 调试上位机（PyQt5 + pyqtgraph）"
+requires-python = ">=3.12"
+dependencies = [
+    "bleak>=0.21",
+    "pyqt5>=5.15,<6",
+    "pyqt5-qt5==5.15.2 ; sys_platform == 'win32'",
+    "pyqtgraph>=0.13",
+    "pyserial>=3.5,<4",
+]

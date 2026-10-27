@@ -4,6 +4,7 @@ import re
 import struct
 import serial
 import time
+import hashlib
 from html import escape
 import serial.tools.list_ports
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
@@ -11,11 +12,13 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout
                              QGroupBox, QTabWidget, QSpinBox, QDoubleSpinBox,
                              QCheckBox, QFileDialog, QMessageBox, QSplitter,
                              QProgressDialog, QListWidget, QDialog, QDialogButtonBox,
-                             QLineEdit, QStackedWidget)
+                             QLineEdit, QStackedWidget, QGridLayout)
 from PyQt5.QtCore import QTimer, Qt, QPointF, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QColor
 import pyqtgraph as pg
 from pyqtgraph import PlotWidget, PlotItem
+from battle_protocol import PlatformProtocolV2
+from battle_protocol.platform import DRIVE_LEASE_MS
 
 # 添加蓝牙支持（需要安装 bleak 库）
 try:
@@ -27,6 +30,9 @@ except ImportError:
     print("未安装 bleak 库，蓝牙功能不可用。请运行: pip install bleak")
 
 import asyncio
+
+BLE_UART_SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb"
+BLE_UART_CHARACTERISTIC_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
 
 
 # ==================== 对战协议 v1：图结构 / 裁判（纯函数） ====================
@@ -149,6 +155,7 @@ class CarLink:
         self.serial_obj = None
         self.encoding = encoding
         self.on_line = on_line             # callback(tag, line)
+        self.protocol_mode = 'V1'
         self.rx_buffer = b''               # bytes 级粘包缓冲
         self._buffer_overflow_warned = False  # 缓冲超限告警只发一次
         # per-car 状态
@@ -208,7 +215,11 @@ class CarLink:
         lines = []
         while b'\n' in self.rx_buffer:
             raw, self.rx_buffer = self.rx_buffer.split(b'\n', 1)
-            line = raw.decode(self.encoding, errors='ignore').rstrip('\r')
+            try:
+                encoding = 'ascii' if self.protocol_mode == 'V2' else self.encoding
+                line = raw.decode(encoding, errors='strict' if self.protocol_mode == 'V2' else 'ignore').rstrip('\r')
+            except UnicodeDecodeError:
+                continue
             line = line.strip()
             if line:
                 lines.append(line)
@@ -311,6 +322,10 @@ class BluetoothConnectionWorker(QThread):
         self.is_running = False
         self.read_characteristic = None  # 需要根据实际设备设置
         self.write_characteristic = None  # 需要根据实际设备设置
+        self.max_write_size = 20
+        self.notify_characteristic = None
+        self.write_with_response = True
+        self.loop = None
         self.buffer = ""  # 用于存储未完成的数据
 
     async def _connect_and_listen(self):
@@ -323,38 +338,69 @@ class BluetoothConnectionWorker(QThread):
                 self.connection_status.emit(False, "连接失败")
                 return
 
-            self.connection_status.emit(True, "连接成功")
-            self.is_running = True
-
             # 获取服务和特征信息（使用新API）
             try:
                 services = self.client.services  # 新的API
                 self.services_found.emit(services)  # 发送服务
-                print("可用服务:")
+                write_candidates = []
+                notify_candidates = []
                 for service in services:
-                    print(f"  Service: {service.uuid}")
                     for char in service.characteristics:
-                        print(f"    Characteristic: {char.uuid}")
+                        properties = {str(prop).lower() for prop in char.properties}
+                        if "write" in properties or "write-without-response" in properties:
+                            write_candidates.append((service.uuid.lower(), char))
+                        if "notify" in properties or "indicate" in properties:
+                            notify_candidates.append(char)
+
+                preferred_write = next((char for service_uuid, char in write_candidates
+                                         if service_uuid == BLE_UART_SERVICE_UUID and
+                                         char.uuid.lower() == BLE_UART_CHARACTERISTIC_UUID), None)
+                write_char = preferred_write or (write_candidates[0][1] if write_candidates else None)
+                if write_char is None:
+                    self.connection_status.emit(False, "未找到可写入的 GATT 特征")
+                    return
+                self.write_characteristic = write_char.uuid
+                self.max_write_size = max(
+                    1,
+                    int(getattr(write_char, "max_write_without_response_size", 20) or 20),
+                )
+                self.write_with_response = "write" in {
+                    str(prop).lower() for prop in write_char.properties
+                }
+                preferred_notify = next(
+                    (char for service in services for char in service.characteristics
+                     if service.uuid.lower() == BLE_UART_SERVICE_UUID and
+                     char.uuid.lower() == BLE_UART_CHARACTERISTIC_UUID and
+                     ({str(prop).lower() for prop in char.properties} & {"notify", "indicate"})),
+                    None
+                )
+                notify_char = preferred_notify or (notify_candidates[0] if notify_candidates else None)
+                self.notify_characteristic = notify_char.uuid if notify_char else None
+                self.read_characteristic = next(
+                    (char.uuid for service in services for char in service.characteristics
+                     if "read" in {str(prop).lower() for prop in char.properties}), None
+                )
+
+                if self.notify_characteristic:
+                    try:
+                        await self.client.start_notify(self.notify_characteristic,
+                                                       self._notification_handler)
+                    except Exception as e:
+                        print(f"启用蓝牙通知失败: {e}")
+                        self.notify_characteristic = None
+
+                self.is_running = True
+                self.connection_status.emit(
+                    True, "连接成功" if self.notify_characteristic else "连接成功（设备未提供通知特征）"
+                )
             except Exception as e:
                 print(f"获取服务信息失败: {e}")
-                # 备用方法：尝试 discover_services
-                try:
-                    services = await self.client.get_services()
-                    self.services_found.emit(services)  # 发送服务
-                    print("可用服务:")
-                    for service in services:
-                        print(f"  Service: {service.uuid}")
-                        for char in service.characteristics:
-                            print(f"    Characteristic: {char.uuid}")
-                except Exception as e2:
-                    print(f"备用方法也失败: {e2}")
+                self.connection_status.emit(False, f"读取 GATT 服务失败: {e}")
+                return
 
-            # 轮询读取数据（替代通知机制）
+            # 接收依赖 GATT 通知；保持连接循环直到用户断开或设备离线。
             while self.is_running and self.client.is_connected:
                 try:
-                    # 示例读取（需要替换为实际特征UUID）
-                    # data = await self.client.read_gatt_char(self.read_characteristic)
-                    # self.process_data(data.decode('utf-8'))
                     await asyncio.sleep(0.1)
                 except Exception as e:
                     print(f"读取数据错误: {e}")
@@ -388,30 +434,49 @@ class BluetoothConnectionWorker(QThread):
             self.connection_status.emit(False, "未安装蓝牙支持库")
             return
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(self._connect_and_listen())
-        loop.close()
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self._connect_and_listen())
+        finally:
+            self.loop.close()
+            self.loop = None
 
     def stop(self):
         self.is_running = False
 
     def send_data(self, data):
         """发送数据到蓝牙设备"""
-        if self.client and self.client.is_connected and self.write_characteristic:
-            # 确保发送的数据以\n结尾
-            if isinstance(data, str) and not data.endswith('\n'):
-                data += '\n'
-            asyncio.create_task(self._send_data_async(data))
+        if not self.is_running or not self.write_characteristic or self.loop is None:
+            return False
+        if isinstance(data, str) and not data.endswith('\n'):
+            data += '\n'
+        coroutine = self._send_data_async(data)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+        except RuntimeError:
+            coroutine.close()
+            return False
+        future.add_done_callback(self._send_finished)
+        return True
+
+    @staticmethod
+    def _send_finished(future):
+        try:
+            future.result()
+        except Exception as e:
+            print(f"发送数据错误: {e}")
 
     async def _send_data_async(self, data):
         """异步发送数据"""
-        try:
-            if isinstance(data, str):
-                data = data.encode('utf-8')
-            await self.client.write_gatt_char(self.write_characteristic, data)
-        except Exception as e:
-            print(f"发送数据错误: {e}")
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        if not self.client or not self.client.is_connected:
+            raise ConnectionError("蓝牙设备未连接")
+        for offset in range(0, len(data), self.max_write_size):
+            chunk = data[offset:offset + self.max_write_size]
+            await self.client.write_gatt_char(self.write_characteristic, chunk,
+                                              response=self.write_with_response)
 
 
 class DeviceSelectionDialog(QDialog):
@@ -474,6 +539,7 @@ class MapWidget(QWidget):
         self.edges = []
         self.adj = {}                          # 无向邻接表（裁判用）
         self.graph = {'nodes': [], 'adj': {}}   # judge_rpos 使用的图结构
+        self.map_version = 'NONE'
 
         # 每辆车独立的显示状态与防抖状态
         self.car_state = {}
@@ -676,6 +742,7 @@ class MapWidget(QWidget):
             # 构建裁判用的无向邻接表与图结构
             self.adj = build_adjacency(self.nodes)
             self.graph = {'nodes': self.nodes, 'adj': self.adj}
+            self.map_version = hashlib.sha256(content.encode('utf-8')).hexdigest()[:8].upper()
 
             # 绘制地图
             self.draw_map()
@@ -949,10 +1016,26 @@ class BluetoothDebugTool(QMainWindow):
             'A': CarLink('A', on_line=self.on_car_line),
             'B': CarLink('B', on_line=self.on_car_line),
         }
+        self.v2_routes = {'A': None, 'B': None}
+        self.ble_v2_role = None
+        self.bluetooth_protocol_mode = 'V1'
+        self.v2_platform = PlatformProtocolV2(
+            self._send_v2_bytes,
+            on_event=self._on_v2_event,
+            on_frame=self._on_v2_frame,
+        )
         self._prev_online = {'A': False, 'B': False}
+        self.manual_drive_timer = QTimer(self)
+        self.manual_drive_timer.setInterval(100)
+        self.manual_drive_timer.timeout.connect(self._repeat_manual_drive)
+        self.held_manual_pwm = None
+        self.held_manual_target = None
 
         # 初始化 UI
         self.init_ui()
+        self.v2_timer = QTimer(self)
+        self.v2_timer.timeout.connect(self._tick_v2)
+        self.v2_timer.start(50)
 
     def init_ui(self):
         self.setWindowTitle("STM32蓝牙调试工具")
@@ -980,6 +1063,14 @@ class BluetoothDebugTool(QMainWindow):
         for tag in ('A', 'B'):
             connection_layout.addWidget(self._build_car_group(tag))
 
+        v2_mode_row = QHBoxLayout()
+        v2_mode_row.addWidget(QLabel("V2 对局模式:"))
+        self.v2_mode_combo = QComboBox()
+        self.v2_mode_combo.addItems(["BENCH", "OFFICIAL"])
+        self.v2_mode_combo.currentTextChanged.connect(self._set_v2_mode)
+        v2_mode_row.addWidget(self.v2_mode_combo)
+        connection_layout.addLayout(v2_mode_row)
+
         # 解码方式选择（两路串口共用）
         decode_layout = QHBoxLayout()
         decode_layout.addWidget(QLabel("解码方式:"))
@@ -1001,6 +1092,15 @@ class BluetoothDebugTool(QMainWindow):
             self.bluetooth_connect_btn.clicked.connect(self.connect_bluetooth_device)
             self.bluetooth_connect_btn.setEnabled(False)
             bluetooth_layout.addWidget(self.bluetooth_connect_btn)
+
+            bluetooth_layout.addWidget(QLabel("协议:"))
+            self.bluetooth_protocol_combo = QComboBox()
+            self.bluetooth_protocol_combo.addItems(["V1", "V2"])
+            bluetooth_layout.addWidget(self.bluetooth_protocol_combo)
+            bluetooth_layout.addWidget(QLabel("角色:"))
+            self.bluetooth_role_combo = QComboBox()
+            self.bluetooth_role_combo.addItems(["A", "B"])
+            bluetooth_layout.addWidget(self.bluetooth_role_combo)
 
             connection_layout.addLayout(bluetooth_layout)
 
@@ -1040,6 +1140,86 @@ class BluetoothDebugTool(QMainWindow):
         send_layout.addLayout(send_btn_layout)
 
         left_layout.addWidget(send_group)
+
+        # 车辆直接控制：按住方向键持续续发，松开立即发送零速指令。
+        manual_group = QGroupBox("车辆直接控制（按住行驶，松开停车）")
+        manual_layout = QVBoxLayout(manual_group)
+        speed_layout = QHBoxLayout()
+        speed_layout.addWidget(QLabel("PWM 速度（0～999）:"))
+        self.drive_speed_input = QSpinBox()
+        self.drive_speed_input.setRange(0, 999)
+        self.drive_speed_input.setSingleStep(50)
+        self.drive_speed_input.setValue(300)
+        speed_layout.addWidget(self.drive_speed_input)
+        speed_layout.addWidget(QLabel("控制目标使用上方“目标”选择。"))
+        manual_layout.addLayout(speed_layout)
+        manual_layout.addWidget(QLabel("命令：DRV:左PWM,右PWM；STOP 停车；ESTOP 急停；START 清除急停并恢复自动。"))
+
+        direction_layout = QGridLayout()
+        self.drive_forward_btn = QPushButton("前进")
+        self.drive_left_btn = QPushButton("左转")
+        self.drive_right_btn = QPushButton("右转")
+        self.drive_back_btn = QPushButton("后退")
+        self.drive_stop_btn = QPushButton("停止")
+        self.drive_estop_btn = QPushButton("急停")
+        self.drive_auto_btn = QPushButton("恢复自动")
+        self.drive_start_btn = QPushButton("启动车辆")
+        self.drive_arm_btn = QPushButton("解除急停")
+        for button in (self.drive_forward_btn, self.drive_left_btn,
+                       self.drive_right_btn, self.drive_back_btn):
+            button.setMinimumHeight(36)
+        direction_layout.addWidget(self.drive_forward_btn, 0, 1)
+        direction_layout.addWidget(self.drive_left_btn, 1, 0)
+        direction_layout.addWidget(self.drive_stop_btn, 1, 1)
+        direction_layout.addWidget(self.drive_right_btn, 1, 2)
+        direction_layout.addWidget(self.drive_back_btn, 2, 1)
+        direction_layout.addWidget(self.drive_auto_btn, 1, 3)
+        direction_layout.addWidget(self.drive_estop_btn, 3, 1)
+        direction_layout.addWidget(self.drive_start_btn, 3, 0)
+        direction_layout.addWidget(self.drive_arm_btn, 3, 2)
+        manual_layout.addLayout(direction_layout)
+        self.drive_forward_btn.pressed.connect(lambda: self._begin_manual_drive(1, 1))
+        self.drive_left_btn.pressed.connect(lambda: self._begin_manual_drive(-1, 1))
+        self.drive_right_btn.pressed.connect(lambda: self._begin_manual_drive(1, -1))
+        self.drive_back_btn.pressed.connect(lambda: self._begin_manual_drive(-1, -1))
+        for button in (self.drive_forward_btn, self.drive_left_btn,
+                       self.drive_right_btn, self.drive_back_btn):
+            button.released.connect(self._end_manual_drive)
+        self.drive_stop_btn.clicked.connect(self._send_manual_stop)
+        self.drive_estop_btn.clicked.connect(self._send_manual_estop)
+        self.drive_auto_btn.clicked.connect(self._resume_auto)
+        self.drive_start_btn.clicked.connect(self._start_selected_vehicle)
+        self.drive_arm_btn.clicked.connect(self._arm_selected_vehicle)
+        left_layout.addWidget(manual_group)
+
+        # V2 比赛级控制（单车练习仍使用上方目标车控制）
+        v2_match_group = QGroupBox("V2 对局控制")
+        v2_match_layout = QGridLayout(v2_match_group)
+        self.v2_prepare_btn = QPushButton("准备比赛")
+        self.v2_prepare_btn.clicked.connect(self._prepare_v2_match)
+        self.v2_start_btn = QPushButton("开始比赛")
+        self.v2_start_btn.clicked.connect(self._start_v2_match)
+        self.v2_pause_btn = QPushButton("暂停比赛")
+        self.v2_pause_btn.clicked.connect(self._pause_v2_match)
+        self.v2_resume_btn = QPushButton("恢复比赛")
+        self.v2_resume_btn.clicked.connect(self._resume_v2_match)
+        self.v2_finish_btn = QPushButton("结束比赛")
+        self.v2_finish_btn.clicked.connect(self._finish_v2_match)
+        self.v2_abort_btn = QPushButton("中止比赛")
+        self.v2_abort_btn.clicked.connect(self._abort_v2_match)
+        self.v2_reset_btn = QPushButton("故障复位")
+        self.v2_reset_btn.clicked.connect(self._reset_v2_fault)
+        self.v2_match_status = QLabel("LOBBY")
+        v2_match_layout.addWidget(self.v2_prepare_btn, 0, 0)
+        v2_match_layout.addWidget(self.v2_start_btn, 0, 1)
+        v2_match_layout.addWidget(self.v2_pause_btn, 1, 0)
+        v2_match_layout.addWidget(self.v2_resume_btn, 1, 1)
+        v2_match_layout.addWidget(self.v2_finish_btn, 2, 0)
+        v2_match_layout.addWidget(self.v2_abort_btn, 2, 1)
+        v2_match_layout.addWidget(self.v2_reset_btn, 3, 0)
+        v2_match_layout.addWidget(QLabel("平台状态:"), 3, 1)
+        v2_match_layout.addWidget(self.v2_match_status, 3, 2)
+        left_layout.addWidget(v2_match_group)
 
         # 接收数据显示区域
         receive_group = QGroupBox("接收数据")
@@ -1135,6 +1315,13 @@ class BluetoothDebugTool(QMainWindow):
         baud_row.addWidget(baud_combo)
         layout.addLayout(baud_row)
 
+        protocol_row = QHBoxLayout()
+        protocol_row.addWidget(QLabel("协议:"))
+        protocol_combo = QComboBox()
+        protocol_combo.addItems(["V1", "V2"])
+        protocol_row.addWidget(protocol_combo)
+        layout.addLayout(protocol_row)
+
         btn_row = QHBoxLayout()
         connect_btn = QPushButton(f"连接 Car {tag}")
         connect_btn.clicked.connect(lambda _=False, t=tag: self.connect_car(t))
@@ -1151,6 +1338,7 @@ class BluetoothDebugTool(QMainWindow):
         self.car_ui[tag] = {
             'port': port_combo,
             'baud': baud_combo,
+            'protocol': protocol_combo,
             'connect': connect_btn,
             'disconnect': disconnect_btn,
             'status': status_label,
@@ -1175,10 +1363,16 @@ class BluetoothDebugTool(QMainWindow):
         if not port:
             QMessageBox.warning(self, "警告", f"请选择 Car {tag} 串口")
             return
+        protocol_mode = ui['protocol'].currentText()
+        if self.ble_v2_role == tag:
+            QMessageBox.warning(self, "连接冲突", f"Car {tag} 已由 BLE 链路承载")
+            return
         try:
             baudrate = int(ui['baud'].currentText())
             self.links[tag].connect(port, baudrate)
             self.links[tag].encoding = self.current_encoding
+            self.links[tag].protocol_mode = protocol_mode
+            self.v2_routes[tag] = 'serial' if protocol_mode == "V2" else None
         except Exception as e:
             QMessageBox.critical(self, "错误", f"Car {tag} 连接失败: {str(e)}")
             return
@@ -1186,13 +1380,18 @@ class BluetoothDebugTool(QMainWindow):
         ui['disconnect'].setEnabled(True)
         ui['port'].setEnabled(False)
         ui['baud'].setEnabled(False)
+        ui['protocol'].setEnabled(False)
         self.append_log(tag, f"已连接 {port}，波特率 {baudrate}")
 
     def disconnect_car(self, tag):
         """断开某车串口"""
         ui = self.car_ui[tag]
         link = self.links[tag]
+        if self.v2_routes[tag] == 'serial':
+            self.v2_platform.disconnect(tag)
+        self.v2_routes[tag] = None
         link.disconnect()
+        link.protocol_mode = 'V1'
         link.pos = None
         link.rpos = None
         link.last_pos_time = 0.0
@@ -1205,6 +1404,7 @@ class BluetoothDebugTool(QMainWindow):
         ui['disconnect'].setEnabled(False)
         ui['port'].setEnabled(True)
         ui['baud'].setEnabled(True)
+        ui['protocol'].setEnabled(True)
         ui['status'].setText("● 离线")
         ui['status'].setStyleSheet("color: #9E9E9E;")
         self._prev_online[tag] = False
@@ -1214,17 +1414,186 @@ class BluetoothDebugTool(QMainWindow):
         """刷新两车在线状态灯；由在线转离线时记录“转发暂停”日志"""
         now = time.time()
         for tag, link in self.links.items():
-            online = link.is_online(now)
-            ui = self.car_ui[tag]
-            if online:
-                ui['status'].setText("● 在线")
-                ui['status'].setStyleSheet("color: #2E7D32; font-weight: bold;")
+            if self.v2_routes[tag] is not None:
+                session = self.v2_platform.sessions[tag]
+                online = session.online
+                if online and session.ready:
+                    status_text = "● V2 READY"
+                    status_style = "color: #2E7D32; font-weight: bold;"
+                elif online:
+                    status_text = "● V2 握手中"
+                    status_style = "color: #EF6C00; font-weight: bold;"
+                else:
+                    status_text = "● 离线"
+                    status_style = "color: #9E9E9E;"
             else:
-                ui['status'].setText("● 离线")
-                ui['status'].setStyleSheet("color: #9E9E9E;")
+                online = link.is_online(now)
+                status_text = "● 在线" if online else "● 离线"
+                status_style = "color: #2E7D32; font-weight: bold;" if online else "color: #9E9E9E;"
+            ui = self.car_ui[tag]
+            ui['status'].setText(status_text)
+            ui['status'].setStyleSheet(status_style)
             if self._prev_online[tag] and not online:
-                self.append_log(tag, "离线（3 秒未收到 POS），转发暂停", LOG_COLOR_GREY)
+                detail = "V2 心跳超时" if self.v2_routes[tag] is not None else "3 秒未收到 POS，转发暂停"
+                self.append_log(tag, f"离线（{detail}）", LOG_COLOR_GREY)
             self._prev_online[tag] = online
+
+    # ---------- V2 协议 / 比赛控制 ----------
+    def _set_v2_mode(self, mode):
+        try:
+            self.v2_platform.set_mode(mode)
+        except RuntimeError as exc:
+            self.v2_mode_combo.blockSignals(True)
+            self.v2_mode_combo.setCurrentText(self.v2_platform.mode)
+            self.v2_mode_combo.blockSignals(False)
+            QMessageBox.warning(self, "模式切换被拒绝", str(exc))
+
+    def _send_v2_bytes(self, car_id, data):
+        route = self.v2_routes.get(car_id)
+        if route == 'serial':
+            link = self.links[car_id]
+            try:
+                return link.send_line(data.decode('ascii')) if link.is_open else False
+            except UnicodeDecodeError:
+                return False
+        if route == 'ble' and self.ble_v2_role == car_id:
+            worker = self.bluetooth_connection_worker
+            if self.is_bluetooth_connected and worker is not None:
+                return worker.send_data(data.decode('ascii'))
+        return False
+
+    def _on_v2_event(self, event, car_id, detail):
+        color = LOG_COLOR_WARN if event in {
+            "FRAME_REJECTED", "STALE_SESSION", "STALE_SEQUENCE", "SEND_FAILED",
+            "ACK_TIMEOUT", "MATCH_FAULT", "OFFLINE", "NACK", "WELCOME_FAILED",
+        } else LOG_COLOR_SYS
+        self.append_log(car_id, f"V2 {event}: {detail}" if detail else f"V2 {event}", color)
+
+    def _tick_v2(self):
+        self.v2_platform.tick()
+        if hasattr(self, 'v2_match_status'):
+            state = self.v2_platform.match_state
+            self.v2_match_status.setText(state)
+            self.v2_match_status.setStyleSheet(
+                "color: #C62828; font-weight: bold;" if state == "FAULT" else "font-weight: bold;"
+            )
+
+    def _on_v2_frame(self, car_id, frame):
+        if frame.type == "POSE":
+            x = int(frame.fields[0]) / 10.0
+            y = int(frame.fields[1]) / 10.0
+            self.links[car_id].pos = (x, y)
+            self.links[car_id].note_pos()
+            self.map_widget.update_car_position(car_id, x, y)
+            return
+        if frame.type == "CLAIM":
+            self._judge_v2_claim(car_id, frame)
+            return
+        if frame.type == "EVENT":
+            self.append_log(car_id, f"EVENT {frame.fields[0]}={frame.fields[1]}")
+            return
+        if frame.type in {"SENSOR", "SPEED", "OPPONENT"}:
+            self.append_log(car_id, f"{frame.type} {','.join(frame.fields)}")
+
+    def _judge_v2_claim(self, car_id, frame):
+        x10, y10 = int(frame.fields[0]), int(frame.fields[1])
+        x, y = x10 / 10.0, y10 / 10.0
+        link = self.links[car_id]
+        self.map_widget.update_car_report(car_id, x, y)
+        reason = "OK"
+        accepted = False
+        graph = self.map_widget.graph
+        if self.v2_platform.mode != "OFFICIAL" or self.v2_platform.match_state != "RUNNING":
+            reason = "BAD_STATE"
+        elif not graph or not graph.get('nodes') or not graph.get('adj'):
+            reason = "MAP_UNAVAILABLE"
+        elif time.time() - link.last_pos_time > 1.0:
+            reason = "POSE_STALE"
+        else:
+            current_node = nearest_node(link.pos, graph.get('nodes'))
+            claim_node = nearest_node((x, y), graph.get('nodes'))
+            distance = graph_dist(current_node, claim_node, graph.get('adj'))
+            if distance is None:
+                reason = "UNMAPPED"
+            elif distance > RPOS_MAX_HOPS:
+                reason = "TOO_FAR"
+            else:
+                accepted = True
+
+        verdict = (f"{frame.seq:08X}", "ACCEPT" if accepted else "REJECT", reason)
+        self.v2_platform.send_message(car_id, "VERDICT", verdict, reliable=False)
+        if accepted:
+            other = 'B' if car_id == 'A' else 'A'
+            opponent = self.v2_platform.sessions[other]
+            if opponent.ready and opponent.online:
+                self.v2_platform.send_message(
+                    other,
+                    "OPPONENT",
+                    (car_id, str(x10), str(y10), f"{frame.seq:08X}", "0"),
+                    reliable=False,
+                )
+        self.append_log(
+            car_id,
+            f"V2 CLAIM ({x:.1f},{y:.1f}) {'接受' if accepted else '拒绝'}: {reason}",
+            LOG_COLOR_SYS if accepted else LOG_COLOR_WARN,
+        )
+
+    def _v2_tag_for_target(self, target):
+        if target in ('A', 'B') and self.v2_routes.get(target) is not None:
+            return target
+        if target == '蓝牙' and self.ble_v2_role is not None:
+            return self.ble_v2_role
+        return None
+
+    def _prepare_v2_match(self):
+        if not self.v2_platform.prepare_official():
+            self.append_log('SYS', "V2 准备比赛失败；请检查 OFFICIAL 模式、地图和两车 READY", LOG_COLOR_WARN)
+
+    def _start_v2_match(self):
+        if not self.v2_platform.start_match():
+            self.append_log('SYS', "V2 开始比赛失败；需处于 PREPARING 且两车在线/未急停", LOG_COLOR_WARN)
+
+    def _pause_v2_match(self):
+        if not self.v2_platform.pause_match():
+            self.append_log('SYS', "V2 暂停请求未发送；当前状态不是 RUNNING", LOG_COLOR_WARN)
+
+    def _resume_v2_match(self):
+        if not self.v2_platform.resume_match():
+            self.append_log('SYS', "V2 恢复失败；需两车在线、READY 且先解除急停", LOG_COLOR_WARN)
+
+    def _finish_v2_match(self):
+        if not self.v2_platform.finish_match():
+            self.append_log('SYS', "V2 结束比赛失败；当前没有可结束的官方对局", LOG_COLOR_WARN)
+
+    def _abort_v2_match(self):
+        if not self.v2_platform.finish_match(abort=True):
+            self.append_log('SYS', "V2 中止比赛失败；当前没有可中止的官方对局", LOG_COLOR_WARN)
+
+    def _reset_v2_fault(self):
+        if not self.v2_platform.reset_fault():
+            self.append_log('SYS', "故障复位失败；请先确认车辆已停车且链路/状态已恢复", LOG_COLOR_WARN)
+
+    def _start_selected_vehicle(self):
+        target = self.send_target_combo.currentText()
+        car_id = self._v2_tag_for_target(target)
+        if car_id:
+            sent = self.v2_platform.start_bench_vehicle(car_id) is not None
+            if not sent:
+                self.append_log(car_id, "单车启动仅限 BENCH，且车辆必须 READY/已解除急停", LOG_COLOR_WARN)
+            return
+        if self._send_control_line("START", target):
+            self.append_log(target, "发送启动/恢复自动导航命令", LOG_COLOR_SYS)
+        else:
+            QMessageBox.warning(self, "警告", f"控制目标 {target} 未连接或不可写")
+
+    def _arm_selected_vehicle(self):
+        target = self.send_target_combo.currentText()
+        car_id = self._v2_tag_for_target(target)
+        if car_id:
+            if self.v2_platform.arm_vehicle(car_id) is None:
+                self.append_log(car_id, "解除急停失败；车辆需停车且不处于 RUNNING", LOG_COLOR_WARN)
+            return
+        QMessageBox.information(self, "V1 控制", "当前 V1 使用 START 清除急停；独立 ARM 仅适用于 V2。")
 
     def update_encoding(self, text):
         """更新解码方式（两路串口共用）"""
@@ -1290,8 +1659,19 @@ class BluetoothDebugTool(QMainWindow):
             QMessageBox.warning(self, "警告", "请先选择蓝牙设备")
             return
 
+        self.bluetooth_protocol_mode = self.bluetooth_protocol_combo.currentText()
+        if self.bluetooth_protocol_mode == "V2":
+            role = self.bluetooth_role_combo.currentText()
+            if self.v2_routes[role] is not None or self.links[role].is_open:
+                QMessageBox.warning(self, "连接冲突", f"Car {role} 已绑定其他链路")
+                return
+            self.ble_v2_role = role
+            self.v2_routes[role] = 'ble'
+
         self.bluetooth_connect_btn.setEnabled(False)
         self.bluetooth_connect_btn.setText("连接中...")
+        self.bluetooth_protocol_combo.setEnabled(False)
+        self.bluetooth_role_combo.setEnabled(False)
 
         device_address = self.selected_bluetooth_device['address']
         self.bluetooth_connection_worker = BluetoothConnectionWorker(device_address)
@@ -1340,22 +1720,45 @@ class BluetoothDebugTool(QMainWindow):
             self.is_bluetooth_connected = False
             self.bluetooth_connect_btn.setText("蓝牙连接")
             self.bluetooth_connect_btn.setEnabled(True)
+            if self.ble_v2_role is not None:
+                self.v2_platform.disconnect(self.ble_v2_role)
+                self.v2_routes[self.ble_v2_role] = None
+                self.ble_v2_role = None
+            self.bluetooth_protocol_combo.setEnabled(True)
+            self.bluetooth_role_combo.setEnabled(True)
             self.receive_text.append(f"蓝牙连接失败: {message}")
 
     def on_bluetooth_data_received(self, data):
-        """接收蓝牙数据（仅入日志，不接入对战数据通道，避免与车载串口数据串仓）"""
+        """接收蓝牙数据；V2 按绑定角色进入统一对战会话。"""
         self.append_log('蓝牙', data)
+        if self.bluetooth_protocol_mode == "V2" and self.ble_v2_role is not None:
+            self.v2_platform.receive_line(self.ble_v2_role, data)
 
     def on_bluetooth_disconnected(self):
         """蓝牙断开连接"""
+        if self.held_manual_target == '蓝牙':
+            self._end_manual_drive(send_stop=False)
+        if self.ble_v2_role is not None:
+            self.links[self.ble_v2_role].pos = None
+            self.links[self.ble_v2_role].rpos = None
+            self.links[self.ble_v2_role].last_pos_time = 0.0
+            self.v2_platform.disconnect(self.ble_v2_role)
+            self.v2_routes[self.ble_v2_role] = None
+            self.ble_v2_role = None
         self.is_bluetooth_connected = False
         self.bluetooth_connect_btn.setText("蓝牙连接")
         self.bluetooth_connect_btn.setEnabled(True)
+        if hasattr(self, 'bluetooth_protocol_combo'):
+            self.bluetooth_protocol_combo.setEnabled(True)
+            self.bluetooth_role_combo.setEnabled(True)
         self.receive_text.append("蓝牙连接已断开")
 
     def send_data(self):
         """按所选目标发送数据（Car A / Car B / 蓝牙）"""
         target = self.send_target_combo.currentText()
+        if self._v2_tag_for_target(target) is not None:
+            QMessageBox.warning(self, "V2 控制", "V2 链路不允许发送原始文本；请使用平台协议控制按钮。")
+            return
         try:
             data = self.send_text.toPlainText()
             # 确保发送的数据以\n结尾
@@ -1381,6 +1784,103 @@ class BluetoothDebugTool(QMainWindow):
             self.bluetooth_connection_worker.send_data(data)
             self.append_log('蓝牙', f"发送: {data.strip()}")
 
+    def _send_control_line(self, command, target=None):
+        target = target or self.send_target_combo.currentText()
+        v2_car = self._v2_tag_for_target(target)
+        if v2_car is not None:
+            if command.startswith("DRV:"):
+                try:
+                    left_pwm, right_pwm = command[4:].split(",", 1)
+                    seq = self.v2_platform.send_command(
+                        v2_car, "DRIVE", str(int(left_pwm)), str(int(right_pwm)), str(DRIVE_LEASE_MS)
+                    )
+                    return seq is not None
+                except (ValueError, TypeError):
+                    return False
+            if command == "STOP":
+                if self.v2_platform.mode == "OFFICIAL" and self.v2_platform.match_state == "RUNNING":
+                    return self.v2_platform.pause_match("SINGLE_CAR_STOP")
+                return self.v2_platform.stop_vehicle(v2_car) is not None
+            if command == "ESTOP":
+                return self.v2_platform.emergency_stop(v2_car)
+            if command == "START":
+                return self.v2_platform.start_bench_vehicle(v2_car) is not None
+            return False
+        data = f"{command}\n"
+        if target in ('A', 'B'):
+            link = self.links[target]
+            return link.send_line(data) if link.is_open else False
+        if target == '蓝牙':
+            if not self.is_bluetooth_connected or not self.bluetooth_connection_worker:
+                return False
+            return self.bluetooth_connection_worker.send_data(data)
+        return False
+
+    def _begin_manual_drive(self, left_sign, right_sign):
+        if self.held_manual_pwm is not None:
+            self._end_manual_drive()
+        target = self.send_target_combo.currentText()
+        speed = self.drive_speed_input.value()
+        pwm = (left_sign * speed, right_sign * speed)
+        if not self._send_control_line(f"DRV:{pwm[0]},{pwm[1]}", target):
+            QMessageBox.warning(self, "警告", f"控制目标 {target} 未连接或不可写")
+            return
+        self.held_manual_pwm = pwm
+        self.held_manual_target = target
+        self.manual_drive_timer.start()
+        self.append_log(target, f"直接控制: 左轮 {pwm[0]} / 右轮 {pwm[1]}", LOG_COLOR_SYS)
+
+    def _repeat_manual_drive(self):
+        if self.held_manual_pwm is None:
+            self.manual_drive_timer.stop()
+            return
+        left_pwm, right_pwm = self.held_manual_pwm
+        if not self._send_control_line(f"DRV:{left_pwm},{right_pwm}", self.held_manual_target):
+            target = self.held_manual_target
+            self._end_manual_drive(send_stop=False)
+            self.append_log(target, "控制链路已断开，停止续发", LOG_COLOR_WARN)
+
+    def _end_manual_drive(self, send_stop=True):
+        self.manual_drive_timer.stop()
+        target = self.held_manual_target
+        was_driving = self.held_manual_pwm is not None
+        self.held_manual_pwm = None
+        self.held_manual_target = None
+        if send_stop and was_driving and target:
+            self._send_control_line("DRV:0,0", target)
+            self.append_log(target, "直接控制松开：停车", LOG_COLOR_SYS)
+
+    def _send_manual_stop(self):
+        self._end_manual_drive(send_stop=False)
+        target = self.send_target_combo.currentText()
+        if self._send_control_line("STOP", target):
+            self.append_log(target, "发送停车命令", LOG_COLOR_SYS)
+        else:
+            QMessageBox.warning(self, "警告", f"控制目标 {target} 未连接或不可写")
+
+    def _send_manual_estop(self):
+        self._end_manual_drive(send_stop=False)
+        target = self.send_target_combo.currentText()
+        if self._send_control_line("ESTOP", target):
+            v2_car = self._v2_tag_for_target(target)
+            reset_hint = "需 ARM 清除" if v2_car is not None else "需 START 清除"
+            self.append_log(target, f"发送急停命令（{reset_hint}）", LOG_COLOR_WARN)
+        else:
+            QMessageBox.warning(self, "警告", f"控制目标 {target} 未连接或不可写")
+
+    def _resume_auto(self):
+        self._end_manual_drive(send_stop=False)
+        target = self.send_target_combo.currentText()
+        v2_car = self._v2_tag_for_target(target)
+        if v2_car is not None:
+            if self.v2_platform.send_command(v2_car, "MODE", "AUTO") is None:
+                self.append_log(v2_car, "切换自动模式失败；检查 V2 会话和比赛状态", LOG_COLOR_WARN)
+            return
+        if self._send_control_line("START", target):
+            self.append_log(target, "发送启动/恢复自动导航命令", LOG_COLOR_SYS)
+        else:
+            QMessageBox.warning(self, "警告", f"控制目标 {target} 未连接或不可写")
+
     # ---------- 对战协议 v1：行处理 / 裁判 / 转发 ----------
     def on_car_line(self, tag, line):
         """CarLink 收到一条完整行：入日志（[A]蓝 / [B]红）并解析"""
@@ -1399,6 +1899,13 @@ class BluetoothDebugTool(QMainWindow):
                 return
             link = self.links.get(src)
             if link is None:
+                return
+
+            if self.v2_routes.get(src) == 'serial':
+                if not line.startswith("@2,"):
+                    self.append_log(src, "V2 链路收到非 V2 帧，已丢弃", LOG_COLOR_WARN)
+                    return
+                self.v2_platform.receive_line(src, line)
                 return
 
             if line.startswith("PID:"):
@@ -1525,11 +2032,15 @@ class BluetoothDebugTool(QMainWindow):
 
     def load_map_file(self):
         """加载地图文件"""
+        if self.v2_platform.match_state in {"PREPARING", "RUNNING", "PAUSED"}:
+            QMessageBox.warning(self, "地图锁定", "比赛进行中不能更换地图。")
+            return
         file_path, _ = QFileDialog.getOpenFileName(
             self, "选择地图文件", "", "C Files (*.c);;All Files (*)")
 
         if file_path:
             if self.map_widget.load_map_from_c_file(file_path):
+                self.v2_platform.set_map_version(self.map_widget.map_version)
                 QMessageBox.information(self, "成功", "地图文件加载成功")
             else:
                 QMessageBox.critical(self, "错误", "地图文件加载失败")
@@ -1556,6 +2067,18 @@ class BluetoothDebugTool(QMainWindow):
 
     def closeEvent(self, event):
         """关窗清理：停止状态灯定时器与两路串口，避免关窗崩溃"""
+        self._end_manual_drive()
+        if self.v2_platform.mode == "OFFICIAL" and self.v2_platform.match_state in {
+            "PREPARING", "RUNNING", "PAUSED",
+        }:
+            self.v2_platform.finish_match(abort=True)
+        for car_id, session in self.v2_platform.sessions.items():
+            if session.ready:
+                self.v2_platform.send_command(car_id, "STOP")
+        try:
+            self.v2_timer.stop()
+        except Exception:
+            pass
         try:
             self.status_timer.stop()
         except Exception:
