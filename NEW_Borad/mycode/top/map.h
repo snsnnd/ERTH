@@ -5,7 +5,7 @@
 
 // 左到右 x变大
 // 下到上 y变大
-// position中 theta; // 全局坐标系下的角度 (rad)，0为正右方向
+// theta：全局坐标系下的角度(rad)，0为+x，逆时针为正
 
 // 地图节点
 typedef struct
@@ -35,7 +35,7 @@ typedef struct
     Node nodes[100];    // 节点数组（最多100个节点）
     Edge edges[400];    // 边数组（最多400条边）
     uint8_t node_count; // 实际节点数量（<=100）
-    uint8_t edge_count; // 实际边数量（<=400）
+    uint16_t edge_count; // 实际边数量（<=400；原为 uint8_t，无法表示 400）
 } Map;
 
 // 全局地图

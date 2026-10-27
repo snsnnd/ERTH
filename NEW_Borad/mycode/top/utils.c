@@ -1,9 +1,15 @@
 #include "utils.h"
 #include <stdint.h>
+#include <string.h> // memcpy：fast_sqrt 位级重解释（避免严格别名 UB）
 #include <math.h> // isnan：C99 中为 math.h 宏，缺失会退化为隐式函数声明（链接隐患）
 #include "BT.h"
 
-// 快速平方根（Quake III算法，单精度）
+// 快速平方根（Quake III 快速平方根倒数，单精度）
+// 修复：原实现先算出 1/sqrt(x)（变量 y），却 `return y * y`，数学上等于 1/x，
+//       因此 fast_sqrt(6400) 返回 0.000156 而不是 80。正确关系是
+//       sqrt(x) = x * (1/sqrt(x))，故返回 x * y。
+// 精度：1 次牛顿迭代后 1/sqrt 相对误差约 0.17%，sqrt 同量级；
+//       若需要精确值（如与阈值比较），请直接调用 sqrtf()。
 float fast_sqrt(float x)
 {
     if (x <= 0.0f)
@@ -14,11 +20,14 @@ float fast_sqrt(float x)
         return 0.0f;
     }
     float xhalf = 0.5f * x;
-    uint32_t i = *(uint32_t *)&x;
-    i = 0x5f3759df - (i >> 1); // 使用统一魔术数
-    x = *(float *)&i;
-    x = x * (1.5f - xhalf * x * x);
-    return x * x; // 修正为返回 sqrt(x)
+    float x0 = x;
+    uint32_t i;
+    memcpy(&i, &x0, sizeof(i)); // memcpy 取代 *(uint32_t*)&x：避免严格别名 UB
+    i = 0x5f3759df - (i >> 1);  // 使用统一魔术数
+    float inv;
+    memcpy(&inv, &i, sizeof(inv));
+    inv = inv * (1.5f - xhalf * inv * inv); // 牛顿迭代：inv ≈ 1/sqrt(x)
+    return x0 * inv;                        // sqrt(x) = x * (1/sqrt(x))
 }
 
 // 低通滤波器初始化

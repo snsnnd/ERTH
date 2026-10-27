@@ -6,7 +6,16 @@
 #include <inttypes.h> // 定义 PRIu16 宏
 
 // 调试日志控制
+// DEBUG_PRINT        ：主循环上下文的调试打印总开关
+// DEBUG_PRINT_VERBOSE：逐节点/逐轮/逐周期的刷屏级打印（默认关，否则主循环会被串口拖慢十几倍）
+// BT_ALLOW_ISR_PRINT ：是否允许在中断上下文里做阻塞串口发送
+//                      默认 0：TIM1 中断（10/20ms）里的 log_print/bt_send_line 直接丢弃。
+//                      原因：115200 下 1 字节约 87us，20ms 节拍里几百字节的打印会让
+//                      中断永不返回；且 HAL_UART_Transmit 不可重入，会切断主循环正在
+//                      发送的 POS/RPOS 协议行。仅在单步排查中断代码时临时置 1。
 #define DEBUG_PRINT 1
+#define DEBUG_PRINT_VERBOSE 0
+#define BT_ALLOW_ISR_PRINT 0
 
 // PID数据 (格式: PID:电机ID,实际值,目标值)
 // 位置数据(POS:x,y)
@@ -33,6 +42,8 @@ void bt_printf(const char *format, ...);
 #define log_print(...) bt_printf(__VA_ARGS__)
 
 // ---------------- 对战协议（SPP 蓝牙行协议，115200 8N1，ASCII 行以 '\n' 结尾） ----------------
+// 控车命令：DRV:<左轮PWM>,<右轮PWM>（有符号，范围 -999..999）；STOP；ESTOP；AUTO；START。
+// DRV 是直控/按住控制，约 400ms 无续发则自动停车；ESTOP 锁存，START 清除并启动导航。
 
 // 单行最大长度（含结尾 '\0'），与协议单行 <40 字节留足余量
 #define BT_LINE_MAX 128

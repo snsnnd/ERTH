@@ -3,6 +3,7 @@
 #define MPU6050_H
 
 #include "main.h"
+#include <stdbool.h>
 
 #define MPU6050_ADDRESS 0xD0 // 若硬件上AD0引脚接高电平，需改为0xD2
 
@@ -52,11 +53,11 @@
 #define MPU6050_GYRO_ZOUT_L 0x48
 
 void MPU6050_WriteReg(uint8_t RegAddress, uint8_t Data);
-void MPU6050_ReadRegs(uint8_t RegAddress, uint8_t *pData, uint16_t Size);
+bool MPU6050_ReadRegs(uint8_t RegAddress, uint8_t *pData, uint16_t Size);
 
 uint8_t mpu6050_init(void);
-void mpu6050_get_acc(int16_t *AccX, int16_t *AccY, int16_t *AccZ);
-void mpu6050_get_gyro(int16_t *GyroX, int16_t *GyroY, int16_t *GyroZ);
+bool mpu6050_get_acc(int16_t *AccX, int16_t *AccY, int16_t *AccZ);
+bool mpu6050_get_gyro(int16_t *GyroX, int16_t *GyroY, int16_t *GyroZ);
 float mpu6050_acc_transition(int16_t acc_value);
 float mpu6050_gyro_transition(int16_t gyro_value); // 陀螺仪原始值 → rad/s（全工程单位契约：rad/s）
 
@@ -64,8 +65,9 @@ float mpu6050_gyro_transition(int16_t gyro_value); // 陀螺仪原始值 → rad
  * @brief  陀螺仪零漂校准（自动计算零偏）
  * @param  gyro_offset：输出参数，存储计算得到的零偏（rad/s）
  * @param  sample_count：校准采样次数（建议1000次以上）
+ * @retval true=采样有效，false=参数错误或有效样本不足一半
  */
-void mpu6050_calibrate_gyro(float *gyro_offset, uint16_t sample_count);
+bool mpu6050_calibrate_gyro(float *gyro_offset, uint16_t sample_count);
 
 void test_mpu6050(void);
 #endif

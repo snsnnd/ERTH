@@ -8,8 +8,6 @@
 #define MAX_NODES 100
 // 危险节点代价倍增因子（可调，>1.0增加危险节点权重）
 #define DANGER_COST_MULTIPLIER 2.0f
-// 最大递归深度（防止A*无限递归）
-#define MAX_ASTAR_RECURSION 2
 
 // 方向枚举（上、下、左、右，对应四领域地图）
 typedef enum

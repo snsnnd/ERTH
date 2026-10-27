@@ -60,10 +60,15 @@ void MPU6050_WriteReg(uint8_t RegAddress, uint8_t Data)
  * @param  Size：要读取的字节数
  * @note   通信流程：Start → 写地址 → 应答 → 发寄存器地址 → 应答 → 重复Start → 读地址 → 应答 → 循环读数据 → Stop
  */
-void MPU6050_ReadRegs(uint8_t RegAddress, uint8_t *pData, uint16_t Size)
+bool MPU6050_ReadRegs(uint8_t RegAddress, uint8_t *pData, uint16_t Size)
 {
     uint8_t ack_flag;
     uint16_t i;
+
+    if (pData == NULL || Size == 0)
+    {
+        return false;
+    }
 
     // 第一步：先发送“寄存器地址”（告诉MPU6050要读哪个寄存器）
     SOFT_I2C_Start();
@@ -74,7 +79,7 @@ void MPU6050_ReadRegs(uint8_t RegAddress, uint8_t *pData, uint16_t Size)
     {
         SOFT_I2C_BusRecover(); // 应答失败（超时/失败）：总线恢复（至多9个时钟脉冲 + STOP）
 
-        return;
+        return false;
     }
 
     // 发送起始寄存器地址
@@ -84,7 +89,7 @@ void MPU6050_ReadRegs(uint8_t RegAddress, uint8_t *pData, uint16_t Size)
     {
         SOFT_I2C_BusRecover(); // 应答失败（超时/失败）：总线恢复（至多9个时钟脉冲 + STOP）
 
-        return;
+        return false;
     }
 
     // 第二步：重复开始信号（切换为读操作）
@@ -96,7 +101,7 @@ void MPU6050_ReadRegs(uint8_t RegAddress, uint8_t *pData, uint16_t Size)
     {
         SOFT_I2C_BusRecover(); // 应答失败（超时/失败）：总线恢复（至多9个时钟脉冲 + STOP）
 
-        return;
+        return false;
     }
 
     // 第三步：循环读取Size个字节（最后1字节发非应答，其余发应答）
@@ -113,6 +118,7 @@ void MPU6050_ReadRegs(uint8_t RegAddress, uint8_t *pData, uint16_t Size)
 
     // 第四步：发送停止信号
     SOFT_I2C_Stop();
+    return true;
 }
 
 /**
@@ -122,17 +128,26 @@ void MPU6050_ReadRegs(uint8_t RegAddress, uint8_t *pData, uint16_t Size)
  * @param  AccZ：Z轴加速度（输出）
  * @note   从0x3B寄存器开始，连续读6字节（XH/XL/YH/YL/ZH/ZL）
  */
-void mpu6050_get_acc(int16_t *AccX, int16_t *AccY, int16_t *AccZ)
+bool mpu6050_get_acc(int16_t *AccX, int16_t *AccY, int16_t *AccZ)
 {
     uint8_t acc_data[6]; // 存储6字节原始数据
 
+    if (AccX == NULL || AccY == NULL || AccZ == NULL)
+    {
+        return false;
+    }
+
     // 读6个连续寄存器（从加速度计X轴高位开始）
-    MPU6050_ReadRegs(MPU6050_ACCEL_XOUT_H, acc_data, 6);
+    if (!MPU6050_ReadRegs(MPU6050_ACCEL_XOUT_H, acc_data, 6))
+    {
+        return false;
+    }
 
     // 拼接16位数据（高8位 << 8 | 低8位）
     *AccX = (int16_t)((acc_data[0] << 8) | acc_data[1]);
     *AccY = (int16_t)((acc_data[2] << 8) | acc_data[3]);
     *AccZ = (int16_t)((acc_data[4] << 8) | acc_data[5]);
+    return true;
 }
 
 /**
@@ -142,17 +157,26 @@ void mpu6050_get_acc(int16_t *AccX, int16_t *AccY, int16_t *AccZ)
  * @param  GyroZ：Z轴陀螺仪（输出）
  * @note   从0x43寄存器开始，连续读6字节（XH/XL/YH/YL/ZH/ZL）
  */
-void mpu6050_get_gyro(int16_t *GyroX, int16_t *GyroY, int16_t *GyroZ)
+bool mpu6050_get_gyro(int16_t *GyroX, int16_t *GyroY, int16_t *GyroZ)
 {
     uint8_t gyro_data[6]; // 存储6字节原始数据
 
+    if (GyroX == NULL || GyroY == NULL || GyroZ == NULL)
+    {
+        return false;
+    }
+
     // 读6个连续寄存器（从陀螺仪X轴高位开始）
-    MPU6050_ReadRegs(MPU6050_GYRO_XOUT_H, gyro_data, 6);
+    if (!MPU6050_ReadRegs(MPU6050_GYRO_XOUT_H, gyro_data, 6))
+    {
+        return false;
+    }
 
     // 拼接16位数据
     *GyroX = (int16_t)((gyro_data[0] << 8) | gyro_data[1]);
     *GyroY = (int16_t)((gyro_data[2] << 8) | gyro_data[3]);
     *GyroZ = (int16_t)((gyro_data[4] << 8) | gyro_data[5]);
+    return true;
 }
 
 /**
@@ -288,46 +312,50 @@ float mpu6050_gyro_transition(int16_t gyro_value)
     return gyro_data * DEG2RAD;
 }
 
-void mpu6050_calibrate_gyro(float *gyro_offset, uint16_t sample_count)
+bool mpu6050_calibrate_gyro(float *gyro_offset, uint16_t sample_count)
 {
     if (gyro_offset == NULL || sample_count == 0)
     {
-        return;
+        return false;
     }
 
     // 初始化累加器
     float sum_gx = 0.0f, sum_gy = 0.0f, sum_gz = 0.0f;
     int16_t raw_gx, raw_gy, raw_gz;
+    uint16_t valid_samples = 0;
 
     // 采集指定次数的陀螺仪数据
     for (uint16_t i = 0; i < sample_count; i++)
     {
         // 读取原始陀螺仪数据
-        mpu6050_get_gyro(&raw_gx, &raw_gy, &raw_gz);
-
-        // mpu6050_gyro_transition 已返回 rad/s（全工程单位契约），直接累加，不可再乘 π/180
-        float gx = mpu6050_gyro_transition(raw_gx);
-        float gy = mpu6050_gyro_transition(raw_gy);
-        float gz = mpu6050_gyro_transition(raw_gz);
-
-        // 累加数据
-        sum_gx += gx;
-        sum_gy += gy;
-        sum_gz += gz;
+        if (mpu6050_get_gyro(&raw_gx, &raw_gy, &raw_gz))
+        {
+            // 转换结果已为 rad/s，直接累加成功读取的数据。
+            sum_gx += mpu6050_gyro_transition(raw_gx);
+            sum_gy += mpu6050_gyro_transition(raw_gy);
+            sum_gz += mpu6050_gyro_transition(raw_gz);
+            valid_samples++;
+        }
 
         // 短暂延时，避免数据过于密集
         HAL_Delay(1);
     }
 
-    // 计算平均值作为零偏（静止时的平均偏移量）
-    gyro_offset[0] = sum_gx / sample_count;
-    gyro_offset[1] = sum_gy / sample_count;
-    gyro_offset[2] = sum_gz / sample_count;
+    if (valid_samples == 0 || valid_samples < sample_count / 2U)
+    {
+        return false;
+    }
+
+    // 计算平均值作为零偏（静止时的平均偏移量）。
+    gyro_offset[0] = sum_gx / valid_samples;
+    gyro_offset[1] = sum_gy / valid_samples;
+    gyro_offset[2] = sum_gz / valid_samples;
 
 #if DEBUG_PRINT
     log_print("X: %.6f, Y: %.6f, Z: %.6f\r\n",
               gyro_offset[0], gyro_offset[1], gyro_offset[2]);
 #endif
+    return true;
 }
 
 void test_mpu6050()
@@ -347,8 +375,13 @@ void test_mpu6050()
         int16_t gyro_x, gyro_y, gyro_z;
 
         // 读取原始数据
-        mpu6050_get_acc(&acc_x, &acc_y, &acc_z);
-        mpu6050_get_gyro(&gyro_x, &gyro_y, &gyro_z);
+        if (!mpu6050_get_acc(&acc_x, &acc_y, &acc_z) ||
+            !mpu6050_get_gyro(&gyro_x, &gyro_y, &gyro_z))
+        {
+            log_print("MPU6050 read failed\r\n");
+            HAL_Delay(100);
+            continue;
+        }
 
         // 转换为物理单位（加速度：g；陀螺仪：rad/s，全工程单位契约）
         float ax = mpu6050_acc_transition(acc_x);

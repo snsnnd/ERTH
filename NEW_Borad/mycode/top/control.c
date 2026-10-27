@@ -3,17 +3,17 @@
 #include "motor.h"
 #include "track_pid.h"
 // speed_pid.h 已不引用：速度环 PID 停调（speed_pid.c/h 模块保留但不再调用），
-// 差速两驱开环直驱，见 forward() 内 OPEN_LOOP_PWM_GAIN
+// 差速两驱开环直驱：循迹环直接给出左右 PWM（见 forward() 与 track_pid.c）
 #include "BT.h"
 #include <math.h>
 #include <stdio.h>
 #include "stdlib.h"
 
-// 地图方向对应的目标角度（弧度，与 current_pose.theta 单位一致）
-// 角度定义：0=向右(+x)，顺时针为正 → 上=-π/2、下=+π/2、左=±π（取 -π 与上/左负号方向一致）
-#define MAP_UP_ANGLE (-1.5707963f)   // 向上（+y方向）：-90° = -π/2
+// 地图方向对应的目标角度（弧度，与位姿变换一致）
+// 角度定义：0=向右(+x)，逆时针为正 → 上=+π/2、下=-π/2、左=±π
+#define MAP_UP_ANGLE 1.5707963f      // 向上（+y方向）：+90° = +π/2
 #define MAP_RIGHT_ANGLE 0.0f         // 向右（+x方向）：0° = 0
-#define MAP_DOWN_ANGLE 1.5707963f    // 向下（-y方向）：+90° = +π/2
+#define MAP_DOWN_ANGLE (-1.5707963f) // 向下（-y方向）：-90° = -π/2
 #define MAP_LEFT_ANGLE (-3.1415927f) // 向左（-x方向）：-180° = -π（与 +π 等价，环绕归一化后等价）
 
 // 弧度制常量定义（全局）
@@ -30,12 +30,8 @@
 #define ANGLE_TOLERANCE_forward 0.349f // 前进容差：20° = 0.349 rad
 #define TURN_AROUND_THRESHOLD 2.967f   // 掉头阈值：170° = 2.967 rad
 
-#define TURN_SPEED 50
-
-// 开环增益：循迹环输出量级 10~30（track_pid.h BASE/MAX/MIN_SPEED），
-// 直接作为 PWM 只有 10%~30% 占空比，动力不足；×3 映射到 30~90（PWM_MAX=100）。
-// 速度环恢复时删除本宏并重新接入 SpeedPID 即可（模块仍在 speed_pid.c）
-#define OPEN_LOOP_PWM_GAIN 3
+// 原地转向速度：量程已改为 0~999（1 kHz PWM），50% 占空比 = 500
+#define TURN_SPEED 500
 
 /**
  * 计算当前角度与目标角度的差值（归一化到 -π ~ π 弧度）
@@ -59,19 +55,17 @@ static float calculate_angle_diff(float target_rad, float current_rad)
 // 1. 参数改为指针，确保结构体状态能被持续更新
 void forward()
 {
-    int track_left, track_right;
+    // 初值 0 兜底：万一循迹函数提前返回也不会把随机值送进电机
+    int pwm_left = 0, pwm_right = 0;
 
-    // 1. 循迹控制：输出左右目标速度（10~30）
-    Track_MainControl(&track_left, &track_right);
+    // 1. 循迹控制：直接输出左右 PWM（0~PWM_MAX=999）
+    //    参数/映射对齐参考车 mishiduobao_f103：直行 292/260，满偏差 ±15% 占空比
+    Track_MainControl(&pwm_left, &pwm_right);
 
-    // 2. 速度环停调（原 SpeedPID_SetTarget/SetCurrent/Compute 四轮闭环已删，
-    //    模块保留于 speed_pid.c 未被调用）：开环经增益映射为 PWM 直接输出。
-    //    差速两驱：同侧两枚举在 motor.c 内合并为一路 TB6612 输出，
-    //    故每侧只需一次调用
-    int16_t pwm_left = (int16_t)(track_left * OPEN_LOOP_PWM_GAIN);
-    int16_t pwm_right = (int16_t)(track_right * OPEN_LOOP_PWM_GAIN);
-    motor_setspeed(motor_front_left, pwm_left);  // 左侧（A 路）
-    motor_setspeed(motor_front_right, pwm_right); // 右侧（B 路）
+    // 2. 开环直驱（速度环停调，模块仍保留在 speed_pid.c 未被调用）
+    //    差速两驱：motor.c 内部把同侧两枚举合并成一路 TB6612 输出，每侧调一次即可
+    motor_setspeed(motor_front_left, (int16_t)pwm_left);   // 左轮（B 路 PB1/CH4）
+    motor_setspeed(motor_front_right, (int16_t)pwm_right); // 右轮（A 路 PB0/CH3）
 }
 
 int map_dir_to_robot_action(Direction map_dir, float *current_pose)
@@ -138,39 +132,40 @@ void print_robot_action(RobotAction action)
     switch (action)
     {
     case ROBOT_ACTION_FORWARD:
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
         log_print("Robot Action: Forward\r\n");
 #endif
         forward();
         break;
     case ROBOT_ACTION_TURN_LEFT:
-#if DEBUG_PRINT
-        log_print("Robot Action: Turn Left (90°)\r\n");
+#if DEBUG_PRINT_VERBOSE
+        log_print("Robot Action: Turn Left (90 deg)\r\n");
 #endif
         turn_left(TURN_SPEED);
         break;
     case ROBOT_ACTION_TURN_RIGHT:
-#if DEBUG_PRINT
-        log_print("Robot Action: Turn Right (90°)\r\n");
+#if DEBUG_PRINT_VERBOSE
+        log_print("Robot Action: Turn Right (90 deg)\r\n");
 #endif
         turn_right(TURN_SPEED);
         break;
     case ROBOT_ACTION_TURN_AROUND:
-#if DEBUG_PRINT
-        log_print("Robot Action: Turn Around (180°)\r\n");
+#if DEBUG_PRINT_VERBOSE
+        log_print("Robot Action: Turn Around (180 deg)\r\n");
 #endif
         turn_back(TURN_SPEED);
         break;
     case ROBOT_ACTION_STOP:
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
         log_print("Robot Action: Stop\r\n");
 #endif
         motor_stop();
         break;
     default:
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
         log_print("Robot Action: Unknown\r\n");
 #endif
+        break; // VERBOSE=0 时 default 分支没有语句，缺 break 会触发 #127-D "expected a statement"
     }
 }
 

@@ -136,7 +136,7 @@ int get_node_index_by_id(const Map *map, uint8_t node_id)
     {
         if (map->nodes[i].node_id == node_id)
         {
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
             log_print("map->node_id:%d neighbors_id:%d\n", map->nodes[i].node_id, node_id);
 #endif
             return i;
@@ -241,9 +241,11 @@ void map_mark_danger_zone(Map *map, uint8_t enemy_node_id)
 
 bool map_validate(const Map *map)
 {
-    // 注：原条件里的 `edge_count > 400` 是恒假比较（edge_count 为 uint8_t，最大 255），
-    // gcc -Wtype-limits 会报 "comparison is always false"，已删除
-    if (map == NULL || map->node_count == 0 || map->node_count > 100)
+    // 注：node_count/edge_count 分别受 nodes[100] / edges[400] 约束。
+    // edge_count 已由 uint8_t 改为 uint16_t（原类型最大 255，无法表示 400 条边），
+    // 因此这里必须显式校验上限，防止越界遍历。
+    if (map == NULL || map->node_count == 0 || map->node_count > 100 ||
+        map->edge_count > (uint16_t)(sizeof(map->edges) / sizeof(map->edges[0])))
     {
 #if DEBUG_PRINT
         log_print("map->Invalid map: Empty or the number of nodes/edges exceeds the limit \r\n");
@@ -279,7 +281,7 @@ bool map_validate(const Map *map)
         } // 校验节点邻居的有效性
     }
 
-    for (uint8_t i = 0; i < map->edge_count; i++)
+    for (uint16_t i = 0; i < map->edge_count; i++)
     {
         if (map->edges[i].node1 >= 100 || map->edges[i].node2 >= 100 ||
             get_node_index_by_id(map, map->edges[i].node1) < 0 ||
@@ -300,12 +302,22 @@ bool map_validate(const Map *map)
 
 void map_get_bounds(const Map *map, float *min_x, float *max_x, float *min_y, float *max_y)
 {
+    // 所有输出参数先清零：原实现把清零语句写在 #if DEBUG_PRINT 里面，
+    // 关闭调试时输出参数保持未初始化，打开调试时又会解引用 NULL 指针。
+    if (min_x != NULL)
+        *min_x = 0.0f;
+    if (max_x != NULL)
+        *max_x = 0.0f;
+    if (min_y != NULL)
+        *min_y = 0.0f;
+    if (max_y != NULL)
+        *max_y = 0.0f;
+
     if (map == NULL || map->node_count == 0 || min_x == NULL || max_x == NULL ||
         min_y == NULL || max_y == NULL)
     {
 #if DEBUG_PRINT
         log_print("map->The map or pointer is invalid and the boundary cannot be obtained\r\n");
-        *min_x = *max_x = *min_y = *max_y = 0.0f;
 #endif
         return;
     }
@@ -354,6 +366,10 @@ void map_globalmap_init_id_map(Map *map)
 // 初始化边代价索引（仅做就绪标记与边表自检，不再建立稠密矩阵）
 void edge_map_init(Map *map)
 {
+    if (map == NULL)
+    {
+        return;
+    }
     if (g_edge_map_inited)
     {
 #if DEBUG_PRINT
@@ -363,8 +379,11 @@ void edge_map_init(Map *map)
     }
 
     // 自检：清点有效边数（node1/node2 需在 ID 范围内）
-    uint8_t valid = 0;
-    for (uint8_t i = 0; i < map->edge_count && i < (uint8_t)(sizeof(map->edges) / sizeof(map->edges[0])); i++)
+    // 注意：索引/上限都必须用 uint16_t——edges[400] 的元素个数是 400，
+    // 原写法 (uint8_t)(sizeof/sizeof) 会截断成 144，导致 144 条之后的边不再自检。
+    uint16_t edge_limit = (uint16_t)(sizeof(map->edges) / sizeof(map->edges[0]));
+    uint16_t valid = 0;
+    for (uint16_t i = 0; i < map->edge_count && i < edge_limit; i++)
     {
         if (map->edges[i].node1 < MAX_NODE_ID && map->edges[i].node2 < MAX_NODE_ID)
         {
@@ -394,7 +413,7 @@ bool map_edge_cost(uint8_t id1, uint8_t id2, float *cost)
     {
         return false;
     }
-    for (uint8_t i = 0; i < global_map.edge_count; i++)
+    for (uint16_t i = 0; i < global_map.edge_count; i++)
     {
         const Edge *e = &global_map.edges[i];
         if ((e->node1 == id1 && e->node2 == id2) || (e->node1 == id2 && e->node2 == id1))
@@ -435,7 +454,7 @@ Node *get_node_by_id(uint8_t node_id)
     // 失败路径在导航循环中可能每周期触发，阻塞打印须受 DEBUG_PRINT 控制
     if (index < 0 || index >= global_map.node_count)
     {
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
         log_print("na->node is not find %d  Index invalid:%d\r\n", node_id, index);
 #endif
         return NULL;

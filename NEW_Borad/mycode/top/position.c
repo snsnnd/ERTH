@@ -136,7 +136,9 @@ static bool map_globalmap_find_next_calib(Map *map,
         const float dy = candidate.y - last_y;
 
         // 1. 距离过近过滤
-        const float dist = fast_sqrt(dx * dx + dy * dy);
+        //    用精确 sqrtf 而不是 fast_sqrt：这里要跟 0.15 地图单位的阈值比较，
+        //    Quake 快速算法的 ~0.17% 误差在阈值附近会改变判定结果。
+        const float dist = sqrtf(dx * dx + dy * dy);
         if (dist < half_pos_thresh)
         {
             continue;
@@ -183,6 +185,7 @@ void localization_init(LocalizationModule *loc,
     if (loc == NULL)
         return;
 
+    (void)track_interval; // 保留接口参数：本版定位按地图节点做航位推算，不使用循迹间距
     map_globalmap_init_id_map(&global_map);
 #if DEBUG_PRINT
     log_print("pos->The map mapping is completed.\n");
@@ -222,10 +225,19 @@ void localization_init(LocalizationModule *loc,
     loc->mpu_data.TRA.gyro_x = 0.0f;
     loc->mpu_data.TRA.gyro_y = 0.0f;
     loc->mpu_data.TRA.gyro_z = 0.0f;
+    loc->gyro_offset[0] = 0.0f;
+    loc->gyro_offset[1] = 0.0f;
+    loc->gyro_offset[2] = 0.0f;
 #if DEBUG_PRINT
     log_print("pos->The MPU data initialization has been completed\n");
 #endif
-    mpu6050_calibrate_gyro(loc->gyro_offset, 5000);
+    // 陀螺零偏标定：取 1000 次 1ms 采样（约 1s）足够压住零偏，原 5000 次要白等约 5s
+    if (!mpu6050_calibrate_gyro(loc->gyro_offset, 1000))
+    {
+#if DEBUG_PRINT
+        log_print("pos->gyro calibration failed; using zero offset\n");
+#endif
+    }
 #if DEBUG_PRINT
     log_print("mpu6050_calibrate_gyro:%f\n", loc->gyro_offset[2]);
 #endif
@@ -248,11 +260,12 @@ void localization_init(LocalizationModule *loc,
     // 初始化时间和校准状态
     loc->last_update_time = timer_get_ms();
     loc->last_calib_time = 0;
+    loc->current_calib.node_id = UINT8_MAX;
     loc->current_calib.x = 0.0f;
     loc->current_calib.y = 0.0f;
     loc->is_calibrated = 0;
     loc->calib_detected = 0;
-    loc->has_last_calib = false;
+    loc->has_current_calib = false;
 #if DEBUG_PRINT
     log_print("pos->The initialization time and calibration status have been completed\n");
 #endif
@@ -265,9 +278,10 @@ void localization_init(LocalizationModule *loc,
     CalibrationPoint first_calib = {init_id, init_x, init_y};
     if (map_globalmap_find_next_calib(&global_map, first_calib, init_theta, 0.3f, &loc->current_calib))
     {
+        loc->has_current_calib = true;
         loc->is_calibrated = 0; // 找到校准点，等待匹配
 #if DEBUG_PRINT
-        log_print("pos->Find the calibration point: %d:(%d,%d)\n", init_id, init_x, init_y);
+        log_print("pos->Find the calibration point: %u:(%.1f,%.1f)\n", init_id, init_x, init_y);
 #endif
     }
     else
@@ -284,7 +298,7 @@ void localization_update(LocalizationModule *loc)
 {
     if (loc == NULL)
         return;
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
     log_print("pos->A location update is about to be carried out\n");
 #endif
 
@@ -292,29 +306,46 @@ void localization_update(LocalizationModule *loc)
     float dt = (float)(current_time - loc->last_update_time) / 1000.0f;
     if (dt <= 0.0f)
         return; // 避免dt为0或负
+
+    // 先确认本次 MPU 采样完整，再消费编码器计数并推进时间戳。
+    // 通信失败时保留上一份有效数据，本周期不积分。
+    if (!sensor_mpu_tra(&loc->mpu_data))
+    {
+        return;
+    }
+
+    sensor_encoder(&loc->wheel_speeds); // 获取轮速 (m/s)
+
+    // 上限保护：中断被长时间阻塞（例如串口/基准节拍被打断）后，单步积分不能吃掉几秒，
+    // 否则一次跳变能把整局定位带飞。20ms 标称节拍，100ms 已是 5 倍余量。
+    if (dt > 0.1f)
+    {
+        dt = 0.1f;
+    }
     loc->last_update_time = current_time;
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
     log_print("pos->time has update: %ums\n", current_time);
 #endif
 
-    // Step 1: 获取传感器数据
-    sensor_encoder(&loc->wheel_speeds); // 获取轮速 (m/s)
-    sensor_mpu_tra(&loc->mpu_data);
-#if DEBUG_PRINT
+    // Step 1: 传感器数据已在上方成功采集
+#if DEBUG_PRINT_VERBOSE
     log_print("pos->encoder has update\n");
 #endif
 
     // Step 2: 正向运动学计算机器人速度（基于轮速）
     mecanum_forward_kinematics(&loc->wheel_speeds, &loc->robot_vel);
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
     log_print("pos->forward_kinematics speed has update\n");
 #endif
 
     // Step 3: 融合角速度（轮子计算的omega与MPU的gyro_z）
     float omega_wheels = loc->robot_vel.omega;
-    float omega_gyro = loc->mpu_data.TRA.gyro_z;
+    // 扣零偏：位姿角速度（参与位置积分）与偏航角必须用同一路已校正的陀螺值。
+    // 原实现只给 yaw 分支扣了 gyro_offset[2]，融合进 pose.omega 的是带零偏的原始值，
+    // 零偏会被积分进位置（km/h 级的慢漂移就是这样来的）。
+    float omega_gyro = loc->mpu_data.TRA.gyro_z - loc->gyro_offset[2];
     float fused_omega = OMEGA_FUSION_ALPHA * omega_wheels + (1.0f - OMEGA_FUSION_ALPHA) * omega_gyro;
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
     log_print("pos->omega has update\n");
 #endif
 
@@ -322,7 +353,7 @@ void localization_update(LocalizationModule *loc)
     loc->current_pose.vx = low_pass_filter_update(&loc->vx_filter, loc->robot_vel.vx);
     loc->current_pose.vy = low_pass_filter_update(&loc->vy_filter, loc->robot_vel.vy);
     loc->current_pose.omega = low_pass_filter_update(&loc->omega_filter, fused_omega);
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
     log_print("pos->low_pass_filter has update\n");
 #endif
 
@@ -330,62 +361,25 @@ void localization_update(LocalizationModule *loc)
     float mid_vx = loc->current_pose.vx;
     float mid_vy = loc->current_pose.vy;
     float mid_omega = loc->current_pose.omega;
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
     log_print("pos->Points update poses has update\n");
 #endif
 
-    // 构造互补滤波所需的传感器数据（X右、Y前、Z上）
-    SensorData sensor_data = {0};
-    // 1. 填充实际加速度计数据（X右、Y前、Z上，单位：m/s²）
-    sensor_data.acc_x = loc->mpu_data.TRA.acc_x; // 实际测量的X轴加速度（右为正）
-    sensor_data.acc_y = loc->mpu_data.TRA.acc_y; // 实际测量的Y轴加速度（前为正）
-    sensor_data.acc_z = loc->mpu_data.TRA.acc_z; // 实际测量的Z轴加速度（上为正，静态时≈9.81）
+    // 平面车没有可观测 yaw 的绝对参考；用滤波后的轮速/陀螺融合角速度积分，
+    // 再由地图校准点纠正长期漂移。加速度计比力不用于航向校正。
+    loc->yaw_attitude.yaw += mid_omega * dt;
 
-    // 2. 填充陀螺仪Z轴数据（已减零偏，单位：rad/s；绕Z轴顺时针为正，需与偏航角定义一致）
-    sensor_data.gyro_z = omega_gyro - loc->gyro_offset[2];
-
-    // 3. 核心：根据X右、Y前方向，计算加速度计偏航参考角（accel_yaw_ref）
-    float accel_yaw_ref;
-    // 水平加速度幅值（仅用XY轴，排除Z轴重力影响）
-    float horizontal_acc_mag = sqrtf(sensor_data.acc_x * sensor_data.acc_x + sensor_data.acc_y * sensor_data.acc_y);
-
-    // 鲁棒性判断：水平加速度足够大时才更新参考角（避免静态时噪声干扰）
-    if (horizontal_acc_mag > 0.1f) // 阈值可根据实际场景调整（如0.05~0.2）
-    {
-        // 关键：X右、Y前方向下，偏航参考角 = atan2(侧向加速度, 前向加速度)
-        // atan2(acc_x, acc_y) 逻辑：
-        // - 仅向前运动（acc_y正，acc_x=0）→ atan2(0, 正) = 0° → 偏航参考0°（朝正前，正确）
-        // - 仅向右运动（acc_x正，acc_y=0）→ atan2(正, 0) = 90° → 偏航参考90°（朝右，正确）
-        // - 仅向左运动（acc_x负，acc_y=0）→ atan2(负, 0) = -90° → 偏航参考-90°（朝左，正确）
-        // - 向右前方运动（acc_x正、acc_y正）→ 参考角0°~90°（符合实际朝向）
-        accel_yaw_ref = atan2f(sensor_data.acc_x, sensor_data.acc_y);
-    }
-    else
-    {
-        // 水平加速度过小时，沿用上次参考角（避免静态噪声导致的参考角抖动）
-        static float last_valid_accel_yaw = 0.0f; // 静态变量保存上次有效参考角
-        accel_yaw_ref = last_valid_accel_yaw;
-        last_valid_accel_yaw = accel_yaw_ref; // 保持参考角稳定
-    }
-
-    // 4. 互补滤波融合（陀螺仪高频预测 + 加速度计低频参考）
-    float last_yaw = loc->yaw_attitude.yaw; // 保存上一时刻偏航角
-    // 陀螺仪积分预测（高频动态：基于角速度更新偏航角）
-    float gyro_predicted_yaw = last_yaw + sensor_data.gyro_z * dt;
-    // 融合公式：alpha（0.8~0.95）越大，越依赖陀螺仪；越小越依赖加速度计
-    loc->yaw_attitude.yaw = COMPLEMENTARY_ALPHA * gyro_predicted_yaw +
-                            (1.0f - COMPLEMENTARY_ALPHA) * accel_yaw_ref;
-
-    // 5. 偏航角范围约束（确保在 [-π, π] 内，避免角度溢出）
+    // 4. 偏航角范围约束（确保在 [-π, π] 内，避免角度溢出）
     loc->yaw_attitude.yaw = fmodf(loc->yaw_attitude.yaw + PI_F, TWO_PI_F) - PI_F;
 
 // 调试打印：验证方向与数值正确性
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
     log_print("YAW:%f,1.5708\n", loc->yaw_attitude.yaw);
 #endif
 
-    // 位置积分（使用中点theta：基于本周期旧 theta，保持中点欧拉语义）
-    float mid_theta = constrain_angle(loc->current_pose.theta - (mid_omega * dt / 2.0f));
+    // 位置积分（中点欧拉：theta 仍为本周期旧值，故用 theta + omega*dt/2 取区间中点）
+    // 原实现写成 theta - omega*dt/2，方向反了，等于用“滞后半拍”的姿态做旋转。
+    float mid_theta = constrain_angle(loc->current_pose.theta + (mid_omega * dt / 2.0f));
     float robot_dx = mid_vx * dt; // 米（轮速单位 m/s）
     float robot_dy = mid_vy * dt;
     float global_dx, global_dy;
@@ -395,17 +389,48 @@ void localization_update(LocalizationModule *loc)
     loc->current_pose.x += real_to_map(global_dx);
     loc->current_pose.y += real_to_map(global_dy);
 
-    // 位置积分已用完旧 theta，之后才把融合（并约束到 [-π,π]）的偏航角
-    // 写回位姿朝向（以陀螺+加速度计融合 yaw 为准）
+    // 位置积分已用完旧 theta，之后才把陀螺积分（并约束到 [-π,π]）的偏航角写回位姿朝向
     loc->current_pose.theta = loc->yaw_attitude.yaw;
-#if DEBUG_PRINT
+
+#if DEBUG_PRINT_VERBOSE
     log_print("pos->position has update x:%.1f y:%.1f theta:%.1f\n", loc->current_pose.x, loc->current_pose.y, loc->current_pose.theta);
 #endif
 }
 
+// 将位姿吸附到当前校准点，并为下一次经过校准线选择前方相邻节点。
+bool localization_apply_calibration(LocalizationModule *loc)
+{
+    if (loc == NULL || !loc->has_current_calib)
+    {
+        return false;
+    }
+
+    CalibrationPoint reached = loc->current_calib;
+    loc->current_pose.x = reached.x;
+    loc->current_pose.y = reached.y;
+    loc->is_calibrated = 1;
+
+    CalibrationPoint next_calib;
+    if (map_globalmap_find_next_calib(&global_map, reached,
+                                      loc->current_pose.theta, 0.3f,
+                                      &next_calib))
+    {
+        loc->current_calib = next_calib;
+        loc->has_current_calib = true;
+    }
+    else
+    {
+        loc->current_calib.node_id = UINT8_MAX;
+        loc->current_calib.x = 0.0f;
+        loc->current_calib.y = 0.0f;
+        loc->has_current_calib = false;
+    }
+
+    return true;
+}
+
 // 获取当前位姿
-// 注意：本函数会被 FSM 在临界区内调用，仅做数据复制，
-// 禁止在此调用 log_print（阻塞串口输出，且原硬编码
+// 本函数仅做数据复制；禁止在此调用 log_print（阻塞串口输出，且原硬编码
 // ENEMY:300.0,400.0 为假数据）。POS/RPOS 由 FSM 节流发送，
 // PID/ENEMY 遥测统一在 robot_protocol_update 中随节流块上报。
 void localization_get_pose(LocalizationModule *loc, Pose *pose)

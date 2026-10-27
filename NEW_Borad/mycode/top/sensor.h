@@ -2,6 +2,7 @@
 #define SENSOR_H
 
 #include "stdint.h"
+#include <stdbool.h>
 #include "hd.h"
 #include "encoder.h"
 // Lidra_driver.h 已删（雷达模块舍弃）
@@ -21,8 +22,18 @@ typedef enum
 // 循迹传感器结构体
 typedef struct
 {
-    uint16_t sensor; // 传感器原始数据（bit0~bit7对应8路传感器，0=黑，1=白）
+    // 8 路数字量：bit0 = 座子第 1 脚（最左侧），bit7 = 第 8 脚（最右侧）
+    // 极性约定：1 = 该路压黑线，0 = 白底。
+    // 依据本工程既有场景表：0x18 = 中间两路黑 → 直线；0xF8 = 左侧 5 路黑；
+    // 0x1F = 右侧 5 路黑；0xFF = 全黑 → 校准点。（原注释“0=黑,1=白”与代码相反，已更正）
+    uint16_t sensor;
 } Track_SensorTypeDef;
+
+// 循迹极性 / 场景常量（唯一事实来源）
+// 实车若发现黑白相反，只改 TRACK_BIT_IS_BLACK 并把两个场景常量互换即可。
+#define TRACK_BIT_IS_BLACK 1
+#define TRACK_ALL_BLACK 0xFFu // 8 路全黑：校准点 / 横向色带
+#define TRACK_ALL_WHITE 0x00u // 8 路全白：丢线
 
 // 定义允许的最大偏差,校准点判断
 #define MAX_DIFF 1
@@ -68,10 +79,10 @@ typedef struct
 void sensor_encoder(ENCODER_SensorTypeDef *encoder);
 
 /***************************  mpu6050  ********************************/
-void sensor_mpu_raw(MPU_SensorTypeDef *mpu);
-void sensor_mpu_tra(MPU_SensorTypeDef *mpu);
-void sensor_mpu_acc_raw(MPU_SensorTypeDef *mpu);
-void sensor_mpu_gyro_raw(MPU_SensorTypeDef *mpu);
+bool sensor_mpu_raw(MPU_SensorTypeDef *mpu);
+bool sensor_mpu_tra(MPU_SensorTypeDef *mpu);
+bool sensor_mpu_acc_raw(MPU_SensorTypeDef *mpu);
+bool sensor_mpu_gyro_raw(MPU_SensorTypeDef *mpu);
 void sensor_mpu_acc_tra(MPU_SensorTypeDef *mpu);
 void sensor_mpu_gyro_tra(MPU_SensorTypeDef *mpu);
 

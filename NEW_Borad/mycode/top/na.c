@@ -101,7 +101,7 @@ static void heap_sift_down(PathNode *heap, uint16_t size, uint16_t index, uint16
 // 核心逻辑：计算给定坐标（地图坐标）的最近节点
 static bool find_closest_node_core(float x_map, float y_map, uint8_t *node_id)
 {
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
     log_print("na->find_closest_node_core: Input map coordinates (%.2f, %.2f)\r\n", x_map, y_map);
 #endif
     float min_dist = FLT_MAX;
@@ -114,7 +114,7 @@ static bool find_closest_node_core(float x_map, float y_map, uint8_t *node_id)
         float dy = y_map - node->y;
         float dist;
         dist = sqrtf(dx * dx + dy * dy);
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
         log_print("na->  Node ID: %d, Node coordinates (%.2f, %.2f), Distance: %.2f\r\n",
                   node->node_id, node->x, node->y, dist);
 #endif
@@ -122,7 +122,7 @@ static bool find_closest_node_core(float x_map, float y_map, uint8_t *node_id)
         {
             min_dist = dist;
             closest_id = node->node_id;
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
             log_print("na->  Updating closest node: ID=%d, New distance=%.2f\r\n", closest_id, min_dist);
 #endif
         }
@@ -136,7 +136,7 @@ static bool find_closest_node_core(float x_map, float y_map, uint8_t *node_id)
         return false;
     }
 
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
     log_print("na->Found closest node: ID=%d, Minimum distance=%.2f\r\n", closest_id, min_dist);
 #endif
     *node_id = closest_id;
@@ -182,6 +182,17 @@ static bool find_closest_node_self(float map_x, float map_y, uint8_t *node_id)
 
     // 直接使用地图坐标计算
     return find_closest_node_core(map_x, map_y, node_id);
+}
+
+// 3. 对外接口：按地图坐标找最近节点（na.h 中声明，原实现只在内部有 static 版本，
+//    导致“声明存在但无定义”，任何外部调用都会链接失败）
+bool find_closest_node(float x, float y, uint8_t *node_id)
+{
+    if (node_id == NULL || global_map.node_count == 0 || !map_validate(&global_map))
+    {
+        return false;
+    }
+    return find_closest_node_core(x, y, node_id);
 }
 
 static float heuristic_distance(uint8_t node1_id, uint8_t node2_id)
@@ -293,18 +304,18 @@ static bool reconstruct_path(uint8_t came_from[], uint8_t current_node_id, uint8
     return true;
 }
 
-static bool a_star_pathfinding(uint8_t start_node_id, uint8_t goal_node_id, Direction *direction, bool allow_danger, uint8_t recursion_depth)
+/* A* 工作区：必须放静态区而不是栈上。
+ * 4 个 MAX_NODES 数组在栈上共约 3.1KB（g_score 400 + came_from 100 + heap 2400 +
+ * heap_indices 200），原来一次导航就会把 1KB 的栈写穿（Keil 报告 Maximum Stack
+ * Usage = 4160 bytes / Stack_Size = 0x400）。本函数只在主循环上下文被
+ * navigate() 调用，不可重入是安全的（已同步删除原 allow_danger 递归重试）。 */
+static float astar_g_score[MAX_NODES];
+static uint8_t astar_came_from[MAX_NODES];
+static PathNode astar_heap[MAX_NODES];
+static uint16_t astar_heap_index[MAX_NODES];
+
+static bool a_star_pathfinding(uint8_t start_node_id, uint8_t goal_node_id, Direction *direction)
 {
-    if (recursion_depth > MAX_ASTAR_RECURSION)
-    {
-#if DEBUG_PRINT
-        log_print("na->A* Recursion depth exceeds limit:%d\r\n", recursion_depth);
-#endif
-        return false;
-    }
-#if DEBUG_PRINT
-    log_print("na->A* Recursion depth is enough\n");
-#endif
     if (direction == NULL || !map_validate(&global_map))
     {
 #if DEBUG_PRINT
@@ -312,7 +323,7 @@ static bool a_star_pathfinding(uint8_t start_node_id, uint8_t goal_node_id, Dire
 #endif
         return false;
     }
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
     log_print("na->A* direction or map is right\n");
 #endif
     Node *start_node = get_node_by_id(start_node_id);
@@ -326,15 +337,15 @@ static bool a_star_pathfinding(uint8_t start_node_id, uint8_t goal_node_id, Dire
     }
     else
     {
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
         log_print("na->start_node:%d goal_node:%d\n", start_node->node_id, goal_node->node_id);
 #endif
     }
 
-    float g_score[MAX_NODES];
-    uint8_t came_from[MAX_NODES];
-    PathNode heap[MAX_NODES];
-    uint16_t heap_indices[MAX_NODES];
+    float *g_score = astar_g_score;
+    uint8_t *came_from = astar_came_from;
+    PathNode *heap = astar_heap;
+    uint16_t *heap_indices = astar_heap_index;
     uint16_t heap_size = 0;
     uint16_t max_heap_size = global_map.node_count;
 
@@ -370,7 +381,7 @@ static bool a_star_pathfinding(uint8_t start_node_id, uint8_t goal_node_id, Dire
 
         if (current.is_goal)
         {
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
             // 回溯路径并打印
             uint8_t path[MAX_NODES];
             uint16_t path_len = 0;
@@ -443,7 +454,7 @@ static bool a_star_pathfinding(uint8_t start_node_id, uint8_t goal_node_id, Dire
 #endif
             continue;
         }
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
         log_print("na->current_node:%d\n", current_node->node_id);
 #endif
         for (uint8_t i = 0; i < current_node->neighbor_count; i++)
@@ -455,14 +466,17 @@ static bool a_star_pathfinding(uint8_t start_node_id, uint8_t goal_node_id, Dire
                 continue; // 跳过无邻居的位置
             }
             Node *neighbor = get_node_by_id(neighbor_id);
-            if (neighbor == NULL || (!allow_danger && neighbor->is_dangerous))
+            if (neighbor == NULL)
                 continue;
 
             float edge_cost = get_edge_cost(current.node_id, neighbor_id);
             if (edge_cost < 0.0f)
                 continue;
 
-            float neighbor_cost = neighbor->is_dangerous ? neighbor->cost * DANGER_COST_MULTIPLIER : neighbor->cost;
+            // 危险惩罚已由 map_mark_danger_zone() 按 DANGER_COST_MULTIPLIER 折进
+            // neighbor->cost，此处直接使用。原实现又乘了一次 → 危险节点实际代价是
+            // 普通节点的 4 倍；且 allow_danger=false 时还整块硬删危险节点，两套策略打架。
+            float neighbor_cost = neighbor->cost;
             float tentative_g = g_score[current.node_id] + edge_cost + neighbor_cost;
 
             if (tentative_g < g_score[neighbor_id])
@@ -496,7 +510,7 @@ static bool a_star_pathfinding(uint8_t start_node_id, uint8_t goal_node_id, Dire
                     {
                         if (goal_in_heap)
                         {
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
                             // 回溯路径并打印
                             uint8_t path[MAX_NODES];
                             uint16_t path_len = 0;
@@ -527,12 +541,10 @@ static bool a_star_pathfinding(uint8_t start_node_id, uint8_t goal_node_id, Dire
         }
     }
 
-    if (!allow_danger)
-    {
-        return a_star_pathfinding(start_node_id, goal_node_id, direction, true, recursion_depth + 1);
-    }
+    // 无路径：不再用 allow_danger 递归重试（递归会让 A* 的 3.4KB 栈帧叠加两倍）。
+    // 危险节点已在代价里体现，单次搜索即最优；找不到就是真的不可达。
 #if DEBUG_PRINT
-    log_print("na->A* No path:%d -> %d\r\n", start_node_id, goal_node_id);
+    log_print("na->A* No path:%u -> %u\r\n", start_node_id, goal_node_id);
 #endif
     return false;
 }
@@ -551,7 +563,7 @@ void map_clear_danger_zone(Map *map)
         map->nodes[i].is_dangerous = 0;
         map->nodes[i].cost = map->nodes[i].base_cost;
     }
-    for (uint8_t i = 0; i < map->edge_count; i++)
+    for (uint16_t i = 0; i < map->edge_count; i++)
     {
         map->edges[i].cost = map->edges[i].distance;
     }
@@ -1093,12 +1105,12 @@ bool navigate(float self_x, float self_y, float enemy_x, float enemy_y, float ta
 
     if (self_node_id == target_node_id)
     {
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
         log_print("na->has been target\n");
 #endif
         *direction = DIRECTION_STOP;
         return true;
     }
 
-    return a_star_pathfinding(self_node_id, target_node_id, direction, false, 0);
+    return a_star_pathfinding(self_node_id, target_node_id, direction);
 }

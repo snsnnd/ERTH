@@ -1,6 +1,18 @@
 #include "track_pid.h"
+#include "motor.h" // PWM_MAX（TIM3 ARR=999 → 满量程 999）
+#include "sensor.h"
 #include "math.h"
 #include "BT.h"
+
+/* ==================== 循迹外环：参考车的"加权位置 + 差速目标"====================
+ * 参考车 mishiduobao_f103 的 6 路权重（L3..R3）：-25, -18, -9, +11, +18, +26
+ * 本车 8 路按同量级扩展成对称权重（中间两路为 0 交叉点）：
+ *   bit0 最左 … bit7 最右
+ * 算法：只统计"压到黑线"的通道，取权重平均作为偏差，
+ *       再按 ±100 CPS/级 折算成左右轮目标速度差，最后按基础 PWM 映射成占空比。
+ * 不丢线时 count==0 → 偏差 0 → 直行（与参考车一致）。
+ */
+static const int16_t sensor_weight[8] = {-25, -18, -11, -4, 4, 11, 18, 25};
 
 static float constrain(float value, float min_val, float max_val)
 {
@@ -18,6 +30,8 @@ static float constrain(float value, float min_val, float max_val)
     }
 }
 
+/* 保留的 PD 实例：当前循迹不走闭环（与参考车一致的开环差速），
+ * 后续接 speed_pid 闭环时可复用。 */
 TrackPI_HandleTypeDef pi_instance = {
     .kp = 9.5f, // 比例系数
     .ki = 1.0f, // 积分系数
@@ -31,8 +45,6 @@ TrackPI_HandleTypeDef pi_instance = {
     .output = 0.0f};
 TrackPI_HandleTypeDef *hpi = &pi_instance;
 
-static const int8_t sensor_weight[8] = {-3, -2, -1, 0, 0, 1, 2, 3};
-
 float Track_CalcError(uint16_t sensor_data)
 {
     int16_t sum = 0;
@@ -40,20 +52,12 @@ float Track_CalcError(uint16_t sensor_data)
 
     for (uint8_t i = 0; i < 8; i++)
     {
-        if (sensor_data & (1 << i))
+        if (sensor_data & (1u << i)) // 1 = 压黑线
         {
             sum += sensor_weight[i];
             count++;
         }
     }
-#if DEBUG_PRINT
-    log_print("track_data:%u\n", sensor_data);
-    for (int i = 0; i < 8; i++)
-    {
-        uint8_t state = (sensor_data >> i) & 1; // 提取每一位状态
-        log_print("sensor%d: %d, ", i, state);  // 打印左侧到右侧的传感器状态
-    }
-#endif
 
     float error = 0.0f;
     if (count == 0)
@@ -65,10 +69,14 @@ float Track_CalcError(uint16_t sensor_data)
         error = (float)sum / count;
     }
 
-// 调试输出传感器数据和计算的偏差
-#if DEBUG_PRINT
-    log_print("count=%u, sum=%d, error=%.2f\n",
-              sensor_data, count, sum, error);
+// 逐位打印 8 路状态：每控制周期 9 行，属刷屏级日志，默认关闭
+#if DEBUG_PRINT_VERBOSE
+    for (int i = 0; i < 8; i++)
+    {
+        uint8_t state = (sensor_data >> i) & 1;
+        log_print("sensor%d: %d, ", i, state);
+    }
+    log_print("error=%.2f (sensor=%u, count=%u, sum=%d)\r\n", error, sensor_data, count, sum);
 #endif
 
     return error;
@@ -104,39 +112,66 @@ float TrackPI_Compute(float target, float current)
     return hpi->output;
 }
 
-void Track_ControlMotor(float pi_output, int *left_speed, int *right_speed)
+void Track_ControlMotor(float error, int *left_pwm, int *right_pwm)
 {
-    *left_speed = BASE_SPEED + pi_output;
-    *right_speed = BASE_SPEED - pi_output;
+    int32_t diff = (int32_t)(error * (float)LINE_DIFF_CPS_PER_LEVEL);
 
-    if (*left_speed > MAX_SPEED)
-        *left_speed = MAX_SPEED;
-    if (*left_speed < MIN_SPEED)
-        *left_speed = MIN_SPEED;
-    if (*right_speed > MAX_SPEED)
-        *right_speed = MAX_SPEED;
-    if (*right_speed < MIN_SPEED)
-        *right_speed = MIN_SPEED;
+    if (diff > LINE_DIFF_CPS_MAX)
+        diff = LINE_DIFF_CPS_MAX;
+    if (diff < -LINE_DIFF_CPS_MAX)
+        diff = -LINE_DIFF_CPS_MAX;
 
-// 调试输出电机速度控制参数
-#if DEBUG_PRINT
-    log_print("Track_ControlMotor: pi_output=%.2f, left_speed=%d, right_speed=%d\n",
-              pi_output, *left_speed, *right_speed);
+    int32_t target_left = (int32_t)LINE_BASE_CPS + diff;
+    int32_t target_right = (int32_t)LINE_BASE_CPS - diff;
+
+    if (target_left > LINE_TARGET_CPS_MAX)
+        target_left = LINE_TARGET_CPS_MAX;
+    if (target_left < LINE_TARGET_CPS_MIN)
+        target_left = LINE_TARGET_CPS_MIN;
+    if (target_right > LINE_TARGET_CPS_MAX)
+        target_right = LINE_TARGET_CPS_MAX;
+    if (target_right < LINE_TARGET_CPS_MIN)
+        target_right = LINE_TARGET_CPS_MIN;
+
+    // 目标速度 → 占空比（与参考车 DifferentialTargetToPwm() 同一映射）
+    int32_t pwm_l = target_left * LINE_LEFT_BASE_PWM / LINE_BASE_CPS;
+    int32_t pwm_r = target_right * LINE_RIGHT_BASE_PWM / LINE_BASE_CPS;
+
+    if (pwm_l > PWM_MAX)
+        pwm_l = PWM_MAX;
+    if (pwm_r > PWM_MAX)
+        pwm_r = PWM_MAX;
+
+    *left_pwm = (int)pwm_l;
+    *right_pwm = (int)pwm_r;
+
+#if DEBUG_PRINT_VERBOSE
+    log_print("trace: err=%.2f diff=%ld tl=%ld tr=%ld pwmL=%ld pwmR=%ld\r\n",
+              error, (long)diff, (long)target_left, (long)target_right,
+              (long)pwm_l, (long)pwm_r);
 #endif
 }
 
-#include "motor.h"
-uint8_t Track_MainControl(int *left_speed, int *right_speed)
+uint8_t Track_MainControl(int *left_pwm, int *right_pwm)
 {
-    uint16_t sensor_data = HD_Parallel_Read();
-    if (sensor_data == 255)
-    {
-        motor_stop();
-        return 0;
-    }
-    float error = Track_CalcError(sensor_data);
-    float pi_output = TrackPI_Compute(0, error);
-    Track_ControlMotor(pi_output, left_speed, right_speed);
+    uint16_t sensor_data = HD_Parallel_Read(); // 1 = 压黑线
 
-    return sensor_data;
+    if (left_pwm == NULL || right_pwm == NULL)
+    {
+        return (uint8_t)sensor_data;
+    }
+
+    // 全白表示丢线：停车等待重新检测到黑线，避免无反馈继续盲走。
+    if (sensor_data == TRACK_ALL_WHITE)
+    {
+        *left_pwm = 0;
+        *right_pwm = 0;
+        return (uint8_t)sensor_data;
+    }
+
+    // 全黑（校准点/横向色带）由 FSM 的校准状态机处理；其余情况继续循迹。
+    float error = Track_CalcError(sensor_data);
+    Track_ControlMotor(error, left_pwm, right_pwm);
+
+    return (uint8_t)sensor_data;
 }

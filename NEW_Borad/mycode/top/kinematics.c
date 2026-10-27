@@ -78,7 +78,7 @@ void mecanum_forward_kinematics(const ENCODER_SensorTypeDef *wheel_speeds, Robot
     robot_vel->vy = 0.0f;                                    // 差速驱动无横向速度
     robot_vel->omega = (right_avg - left_avg) / TRACK_WIDTH; // 角速度=(右轮速-左轮速)/轮距
 
-#if DEBUG_PRINT
+#if DEBUG_PRINT_VERBOSE
     log_print("robot_vel->vx:%f,robot_vel->vy:%f,robot_vel->omega:%f\n", robot_vel->vx, robot_vel->vy, robot_vel->omega);
 #endif
 }

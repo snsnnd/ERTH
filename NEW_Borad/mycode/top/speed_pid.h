@@ -4,9 +4,10 @@
 #include "stm32f1xx_hal.h" // 实际 MCU：STM32F103C8T6（原理图卡片）
 
 // 速度环参数宏定义（根据硬件调整）
-#define SPEED_MAX_TARGET 30  // 最大目标速度（如rpm或PWM值）
-#define SPEED_MIN_TARGET 10  // 最小目标速度
-#define SPEED_OUTPUT_MAX 100 // 速度环输出限幅（PWM调节范围）
+// 注意：PWM 量程已改为 0~999（TIM3 ARR=999，1 kHz），重新启用速度环时按此调参
+#define SPEED_MAX_TARGET 2300 // 最大目标速度（CPS，与参考车 target_cps_max 一致）
+#define SPEED_MIN_TARGET 180  // 最小目标速度（CPS）
+#define SPEED_OUTPUT_MAX 999  // 速度环输出限幅（= PWM 满量程 PWM_MAX）
 
 // 速度环PID结构体
 typedef struct

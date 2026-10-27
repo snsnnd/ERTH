@@ -12,29 +12,56 @@ int SDA_bit = 1;
 #define SOFT_I2C_WAIT_TIMEOUT 10000U
 
 /*
+ * 底层：把一根线驱动到指定电平
+ * 参数：level 1=释放总线（切输入+内部上拉），0=开漏拉低
+ * 说明：STM32F1 的 GPIO 在“输出模式”下不会接通内部上/下拉（PUPD 只对输入模式有效），
+ *       所以“释放=高”必须真的切到输入+上拉，否则总线只能靠外部上拉浮起来；
+ *       而“拉低”用开漏输出，避免与从机拉低时形成推挽对打（原实现是推挽，读 SDA 时
+ *       主机强驱动高、从机拉低 → 大电流冲突，偶发应答失败/读错位多来自这里）。
+ */
+static void soft_i2c_pin_drive(GPIO_TypeDef *port, uint16_t pin, uint8_t level)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    gpio.Pin = pin;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    if (level)
+    {
+        gpio.Mode = GPIO_MODE_INPUT; // 释放：高阻 + 内部上拉
+        HAL_GPIO_Init(port, &gpio);
+    }
+    else
+    {
+        gpio.Mode = GPIO_MODE_OUTPUT_OD; // 拉低：开漏
+        HAL_GPIO_Init(port, &gpio);
+        HAL_GPIO_WritePin(port, pin, GPIO_PIN_RESET);
+    }
+    RCCdelay_us(5); // 位延时（含建立/保持，足够覆盖 100kHz 软 I2C）
+}
+
+/*
  *函数：I2C写SCL电平
  *参数：BitValue 当前需要写入SCL的电平，值为0或1
  *返回值：无
- *注意事项：当BitValue为0时，置SCL为低电平；当BitValue为1时，置SCL为高电平
+ *注意事项：当BitValue为0时，置SCL为低电平；当BitValue为1时，释放SCL（开漏+上拉）
  */
 void SOFT_I2C_W_SCL(uint8_t BitValue)
 {
-    HAL_GPIO_WritePin(SCL_PORT, SCL_PIN, (BitValue ? GPIO_PIN_SET : GPIO_PIN_RESET));
+    soft_i2c_pin_drive(SCL_PORT, SCL_PIN, (BitValue != 0) ? 1 : 0);
     SCL_bit = BitValue;
-    RCCdelay_us(5);
 }
 
 /*
  *函数：I2C写SDA电平
  *参数：BitValue 当前需要写入SDA的电平，值为0或1
  *返回值：无
- *注意事项：当BitValue为0时，置SDA为低电平；当BitValue为1时，置SCL为高电平
+ *注意事项：当BitValue为0时，置SDA为低电平；当BitValue为1时，释放SDA（开漏+上拉）
  */
 void SOFT_I2C_W_SDA(uint8_t BitValue)
 {
-    HAL_GPIO_WritePin(SDA_PORT, SDA_PIN, (BitValue ? GPIO_PIN_SET : GPIO_PIN_RESET));
+    soft_i2c_pin_drive(SDA_PORT, SDA_PIN, (BitValue != 0) ? 1 : 0);
     SDA_bit = BitValue;
-    RCCdelay_us(5);
 }
 
 /*

@@ -30,6 +30,14 @@ static uint32_t last_sample_time[ENCODER_SIDE_CNT] = {0};
 // 每侧同一次采样的缓存（供同侧第二次读取复用）
 static float side_speed_cache[ENCODER_SIDE_CNT] = {0.0f, 0.0f};
 static uint32_t side_cache_ms[ENCODER_SIDE_CNT] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+static uint8_t side_cache_valid[ENCODER_SIDE_CNT] = {0, 0};
+
+// 同一次采样的复用窗口（ms）。上层在一个控制周期里会按 4 个枚举各读一次，
+// 实际只有 2 路计数器且“读取即清零”，所以同侧第二次必须复用缓存值。
+// 原实现以“同一毫秒”为缓存键：4 次读取恰好跨过 1ms 边界时，同侧第二次读到的是
+// 已被清零的计数器 → 速度 0。改用固定时间窗后与毫秒边界无关。
+#define ENCODER_SAMPLE_HOLD_MS 5U
+
 // 每脉冲对应的距离（单位：米/脉冲，与硬件相关）
 static float distance_per_pulse = 0.0f;
 
@@ -53,6 +61,7 @@ void encoder_init(void)
     {
         last_sample_time[i] = HAL_GetTick(); // 使用HAL库的毫秒级时间函数
         side_cache_ms[i] = 0xFFFFFFFFu;      // 尚无缓存
+        side_cache_valid[i] = 0;
     }
 }
 
@@ -98,11 +107,10 @@ float encoder_readspeed(enum ENCODER encoder)
     // 2. 获取当前时间并计算间隔
     current_time = HAL_GetTick();
 
-    // 硬件只有 2 路编码器，同侧前后轮共用同一次采样：
-    // 同 1ms 内的重复读取直接复用缓存（计数器读取即清零，
-    // 否则同侧第二次读取会得到 0）。同侧所有枚举的方向校正规则
-    // 一致（右负左正），缓存值可直接复用。
-    if (current_time == side_cache_ms[side])
+    // 硬件只有 2 路编码器，同侧前后轮共用同一次采样：复用窗口内直接返回缓存值
+    // （见 ENCODER_SAMPLE_HOLD_MS 说明）。同侧所有枚举的方向校正规则一致（右负左正）。
+    if (side_cache_valid[side] &&
+        (uint32_t)(current_time - side_cache_ms[side]) < ENCODER_SAMPLE_HOLD_MS)
     {
         return side_speed_cache[side];
     }
@@ -123,17 +131,11 @@ float encoder_readspeed(enum ENCODER encoder)
     __HAL_TIM_SET_COUNTER(TIM, 0);
 
     // 5. 处理方向：将无符号计数器值转换为含符号的脉冲数
-    // 16位无符号范围：0~65535，中间值32767.5，以此区分正反转
-    if (raw_counter > 32768)
-    {
-        // 反转：计数器因递减溢出，实际脉冲数为负（绝对值=65535 - raw_counter）
-        pulse = -(65535 - raw_counter);
-    }
-    else
-    {
-        // 正转：计数器递增，脉冲数为正
-        pulse = (int16_t)raw_counter;
-    }
+    // 16 位编码器计数器向上/向下计数，向下回绕到 ARR=65535：
+    //   -1 脉冲 → 0xFFFF，-2 → 0xFFFE …
+    // 直接按 int16_t 重新解释即为正确的补码映射。
+    // （原公式 -(65535 - raw_counter) 每个负脉冲都差 1：-1 被算成 0、-2 被算成 -1）
+    pulse = (int16_t)raw_counter;
 
     // 6. 计算速度：含方向（脉冲数符号决定速度符号）
     speed = (float)pulse * distance_per_pulse / dt;
@@ -145,15 +147,14 @@ float encoder_readspeed(enum ENCODER encoder)
         speed = -speed;
     }
 
-    // 8. 更新采样时间与同侧缓存（同侧第二次读取直接复用）
+    // 8. 更新采样时间与同侧缓存（复用窗口内的后续读取直接返回本值）
     last_sample_time[side] = current_time;
     side_speed_cache[side] = speed;
     side_cache_ms[side] = current_time;
+    side_cache_valid[side] = 1;
 
     return speed;
 }
-
-#include "stdio.h" // 若需要使用sprintf等格式化输出
 
 /**
  * @brief 测试指定编码器的正负方向
@@ -169,21 +170,21 @@ void encoder_test_direction(enum ENCODER encoder)
     // 绑定编码器对应的定时器（同侧前后轮共用一路）
     if ((unsigned)encoder > (unsigned)encoder_back_right)
     {
-        log_print("错误：无效的编码器编号！\r\n");
+        log_print("ERROR: invalid encoder id!\r\n");
         return;
     }
     TIM = enc_side_tim(enc_side_of[encoder]);
 
     // 第一步：测试正向转动
-    log_print("\n请正向转动编码器（如向前推对应轮子）...\r\n");
+    log_print("\nPlease turn the encoder forward (e.g. push the wheel forward)...\r\n");
     encoder_clearcounter();                       // 清零计数器
-    HAL_Delay(5000);                              // 等待2秒，留给用户操作时间
+    HAL_Delay(5000);                              // 等待5秒，留给用户操作时间
     raw_cnt_forward = (uint16_t)__HAL_TIM_GET_COUNTER(TIM); // 读取正向转动后的计数
 
     // 第二步：测试反向转动
-    log_print("请反向转动编码器（如向后拉对应轮子）...\r\n");
+    log_print("Please turn the encoder backward (e.g. pull the wheel backward)...\r\n");
     encoder_clearcounter();                        // 再次清零计数器
-    HAL_Delay(5000);                               // 等待2秒
+    HAL_Delay(5000);                               // 等待5秒
     raw_cnt_backward = (uint16_t)__HAL_TIM_GET_COUNTER(TIM); // 读取反向转动后的计数
 
     // 转换为有符号16位整数（处理16位计数器的溢出/方向特性）
@@ -191,22 +192,22 @@ void encoder_test_direction(enum ENCODER encoder)
     signed_cnt_backward = (int16_t)raw_cnt_backward;
 
     // 输出原始数据供参考
-    log_print("测试结果：\r\n");
-    log_print("正向转动计数（原始）：%u，（有符号）：%d\r\n", raw_cnt_forward, signed_cnt_forward);
-    log_print("反向转动计数（原始）：%u，（有符号）：%d\r\n", raw_cnt_backward, signed_cnt_backward);
+    log_print("Test result:\r\n");
+    log_print("forward raw: %u, signed: %d\r\n", raw_cnt_forward, signed_cnt_forward);
+    log_print("backward raw: %u, signed: %d\r\n", raw_cnt_backward, signed_cnt_backward);
 
     // 判断方向是否符合预期（正转负转计数符号相反）
     if ((signed_cnt_forward > 0 && signed_cnt_backward < 0) ||
         (signed_cnt_forward < 0 && signed_cnt_backward > 0))
     {
-        log_print("编码器方向测试通过：正转和反转计数符号相反\r\n");
+        log_print("Encoder direction test PASSED: forward/backward counts have opposite signs\r\n");
     }
     else if (signed_cnt_forward == 0 && signed_cnt_backward == 0)
     {
-        log_print("警告：未检测到转动，请确保轮子有明显转动\r\n");
+        log_print("WARNING: no rotation detected, make sure the wheel really turns\r\n");
     }
     else
     {
-        log_print("编码器方向测试失败：正转和反转计数符号相同（可能接线或配置错误）\r\n");
+        log_print("Encoder direction test FAILED: forward/backward counts have the same sign (check wiring/config)\r\n");
     }
 }

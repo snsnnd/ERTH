@@ -11,9 +11,9 @@
 // 定位数据结构体
 typedef struct
 {
-    float x;     // 全局坐标系X坐标 (m)
-    float y;     // 全局坐标系Y坐标 (m)
-    float theta; // 全局坐标系下的角度 (rad)，0为正右方向
+    float x;     // 全局坐标系X坐标（地图单位：1 单位 = MAP_SCALE = 0.01 m，即厘米）
+    float y;     // 全局坐标系Y坐标（地图单位，同上）
+    float theta; // 全局坐标系下的角度(rad)，0为+x，逆时针为正
     float vx;    // X方向速度 (m/s)
     float vy;    // Y方向速度 (m/s)
     float omega; // 角速度 (rad/s)
@@ -23,8 +23,8 @@ typedef struct
 typedef struct
 {
     uint8_t node_id;
-    float x; // 校准点X坐标 (m)
-    float y; // 校准点Y坐标 (m)
+    float x; // 校准点X坐标（地图单位，1 单位 = 1 cm）
+    float y; // 校准点Y坐标（地图单位）
 } CalibrationPoint;
 
 // 定位模块结构体
@@ -50,8 +50,7 @@ typedef struct
     Pose current_pose; // 当前位姿
 
     CalibrationPoint current_calib; // 当前待匹配的校准点（来自globalmap）
-    CalibrationPoint last_calib;    // 上一次成功匹配的校准点
-    bool has_last_calib;            // 是否存在上一次校准点（初始为false）
+    bool has_current_calib;         // current_calib 是否为有效目标
 
     uint32_t last_update_time; // 上一次更新时间 (ms)
     uint32_t last_calib_time;  // 上次校准时间 (ms)，用于防跳变
@@ -68,6 +67,7 @@ void localization_init(LocalizationModule *loc,
 
 // 更新定位数据
 void localization_update(LocalizationModule *loc);
+bool localization_apply_calibration(LocalizationModule *loc);
 
 // 获取当前位姿
 void localization_get_pose(LocalizationModule *loc, Pose *pose);

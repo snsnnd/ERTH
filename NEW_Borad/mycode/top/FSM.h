@@ -46,6 +46,17 @@ typedef struct
 
     Direction current_direction;
 
+    // 安全门控：1=允许电机输出；上电默认 0，STOP/超时/急停置 0。
+    uint8_t motion_enable;
+    // 1=急停锁存：必须显式发送 START 才解除。
+    uint8_t estop;
+
+    // 蓝牙直控门控：上电默认停车；超时仅清零电机，需显式发送 AUTO 恢复导航。
+    uint8_t manual_control;
+    int16_t manual_left_pwm;
+    int16_t manual_right_pwm;
+    uint32_t manual_last_command_ms;
+
     // 状态标志
     uint8_t has_target : 1;
     uint8_t has_enemy : 1;
